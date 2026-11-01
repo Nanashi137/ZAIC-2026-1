@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+.venv/
+.venv-asr/
+.uv-cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+outputs/
+*.log
+
+# Private competition materials and derived artifacts.
+data/
+cache/
+traces/
+models/

@@ -1,0 +1,38 @@
+[project]
+name = "lifemate-zac-2026"
+version = "0.1.0"
+description = "Competition-compliant text-only LifeMate tool agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.8,<1",
+]
+asr = [
+    "qwen-asr==0.0.6; python_version < '3.14'",
+    "torch==2.12.1; sys_platform == 'win32' or sys_platform == 'linux'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "integration: uses the local official public-test SDK and dataset",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
