@@ -6,7 +6,7 @@ from pathlib import Path
 from lifemate.agent import LlmDecisionSource
 from lifemate.asr import Qwen3ASRSettings, TranscriptionResult
 from lifemate.audio_pipeline import AudioInferencePipeline
-from lifemate.model import InferenceSettings, ModelResponse, ScriptedModelClient
+from lifemate.model import InferenceSettings, ModelResponse, ModelToolCall, ScriptedModelClient
 from lifemate.runtime import ExplicitActionSource, Runtime, ToolAction
 from tests.support import FakeFactory, FakeSession, make_dataset
 
@@ -91,7 +91,17 @@ def test_history_is_model_context_only_and_historical_tools_are_not_replayed(tmp
     dataset = make_dataset(tmp_path, history=history)
     _audio_files(dataset, ["public_test_1.wav", "earlier.wav"])
     session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
-    client = ScriptedModelClient([ModelResponse(content='{"status":"done","reason":"complete"}')])
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ModelToolCall(
+                        "finish", "agent__finish", '{"status":"done","reason":"complete"}'
+                    ),
+                )
+            )
+        ]
+    )
     source = LlmDecisionSource(client, InferenceSettings(model="fixture"))
     transcriber = FakeTranscriber({"public_test_1.wav": "Xong chưa?", "earlier.wav": "Đặt lúc bảy giờ"})
 

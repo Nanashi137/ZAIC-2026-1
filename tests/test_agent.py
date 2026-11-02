@@ -29,6 +29,19 @@ def _tool_response(call_id: str, name: str, arguments: dict[str, Any]) -> ModelR
     )
 
 
+def _finish_response(status: str = "done", reason: str = "complete") -> ModelResponse:
+    return ModelResponse(
+        tool_calls=(
+            ModelToolCall(
+                "finish",
+                "agent__finish",
+                json.dumps({"status": status, "reason": reason}),
+            ),
+        ),
+        usage=ModelUsage(5, 2, 7),
+    )
+
+
 def _source(*responses: ModelResponse, max_invalid_proposals: int = 2):
     client = ScriptedModelClient(list(responses))
     source = LlmDecisionSource(
@@ -60,8 +73,13 @@ def test_dynamic_tools_keep_only_allowed_and_translate_sdk_extensions() -> None:
 
     registry = ModelToolRegistry.from_allowed(allowed)
 
-    assert registry.model_to_official == {"sms__send": "sms.send"}
-    function = registry.definitions[0]["function"]
+    assert registry.model_to_official == {
+        "sms__send": "sms.send",
+        "agent__finish": "agent.finish",
+    }
+    function = next(
+        item["function"] for item in registry.definitions if item["function"]["name"] == "sms__send"
+    )
     assert function["strict"] is False
     assert function["parameters"]["additionalProperties"] is False
     assert not FORBIDDEN_ROOT_KEYWORDS.intersection(function["parameters"])
@@ -214,7 +232,7 @@ def test_model_loop_uses_observation_id_for_dependent_read_then_write(tmp_path) 
             "sms__send",
             {"contact_id": "observed_contact_7", "content": "Xin chào"},
         ),
-        ModelResponse(content='{"status":"done","reason":"message sent"}', usage=ModelUsage(5, 2, 7)),
+        _finish_response(reason="message sent"),
     )
 
     result = Runtime(dataset, session_factory=FakeFactory(session)).run(
@@ -237,7 +255,7 @@ def test_model_loop_uses_observation_id_for_dependent_read_then_write(tmp_path) 
         definition["function"]["name"]
         for definition in client.requests[0].tools
     }
-    assert offered == {"contacts__search", "sms__send", "sys__ask_missing_info"}
+    assert offered == {"agent__finish", "contacts__search", "sms__send", "sys__ask_missing_info"}
     initial_payload = json.loads(client.requests[0].messages[1]["content"])
     assert initial_payload["public_context"]["current_time"] == "2026-10-30T10:00:00+07:00"
     assert initial_payload["final_user_transcript_source"] == "debug_override"
@@ -272,7 +290,7 @@ def test_unavailable_tool_is_not_executed_and_model_can_finish_unsupported(tmp_p
     dataset = make_dataset(tmp_path)
     source, _ = _source(
         _tool_response("call_unknown", "sms__send", {"content": "hello"}),
-        ModelResponse(content='{"status":"unsupported","reason":"SMS is unavailable"}'),
+        _finish_response("unsupported", "SMS is unavailable"),
     )
 
     result = Runtime(dataset, session_factory=FakeFactory(session)).run("public_test_1", "send SMS", source)
@@ -289,12 +307,16 @@ def test_bad_model_arguments_retry_without_sdk_execution(tmp_path) -> None:
     source, client = _source(
         ModelResponse(tool_calls=(ModelToolCall("bad", "alarm__list", "{not json"),)),
         _tool_response("good", "alarm__list", {}),
-        ModelResponse(content='{"status":"done","reason":"listed"}'),
+        _finish_response(reason="listed"),
     )
 
     result = Runtime(dataset, session_factory=FakeFactory(session)).run("public_test_1", "list alarms", source)
 
-    assert [step.status for step in result.steps] == ["model_bad_output", "read_succeeded"]
+    assert [step.status for step in result.steps] == [
+        "model_bad_output",
+        "read_succeeded",
+        "agent_finished",
+    ]
     assert session.calls == [{"name": "alarm.list", "arguments": {}}]
     assert len(client.requests) == 3
 
@@ -377,7 +399,7 @@ def test_refusal_model_error_bad_output_limit_and_max_steps_terminate_safely(tmp
     capped, client = _source(
         _tool_response("one", "alarm__list", {}),
         _tool_response("two", "alarm__list", {}),
-        ModelResponse(content='{"status":"done","reason":"unused"}'),
+        _finish_response(reason="unused"),
     )
     cap_result = Runtime(
         dataset,
@@ -408,7 +430,7 @@ def test_noop_observation_is_returned_to_model_before_finish(tmp_path) -> None:
     dataset = make_dataset(tmp_path, installed_tools=installed, extra_tools=[update_tool])
     source, client = _source(
         _tool_response("noop", "alarm__update", {"alarm_id": "observed-but-stale"}),
-        ModelResponse(content='{"status":"done","reason":"no matching alarm"}'),
+        _finish_response(reason="no matching alarm"),
     )
 
     result = Runtime(dataset, session_factory=FakeFactory(session)).run("public_test_1", "update alarm", source)
@@ -417,3 +439,151 @@ def test_noop_observation_is_returned_to_model_before_finish(tmp_path) -> None:
     assert result.termination_reason == "model_completed"
     feedback = [message for message in client.requests[1].messages if message["role"] == "tool"][-1]
     assert '"status":"no_op"' in feedback["content"]
+
+
+@pytest.mark.parametrize(
+    ("status", "termination"),
+    [("done", "model_completed"), ("unsupported", "unsupported_request")],
+)
+def test_synthetic_finish_is_local_and_never_reaches_sdk(tmp_path, status, termination) -> None:
+    allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
+    session = FakeSession(allowed)
+    source, client = _source(_finish_response(status, "fixture completion"))
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "finish fixture", source)
+
+    assert result.termination_reason == termination
+    assert [step.status for step in result.steps] == ["agent_finished"]
+    assert session.validations == []
+    assert session.calls == []
+    assert result.submission["tool_calls"] == []
+    finish = next(
+        item["function"]
+        for item in client.requests[0].tools
+        if item["function"]["name"] == "agent__finish"
+    )
+    assert finish["strict"] is True
+
+
+def test_controller_does_not_invent_progress_when_model_finishes_without_actions(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    source, _ = _source(_finish_response(reason="model says complete"))
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "create an alarm at seven", source)
+
+    # The controller has no reliable semantic task-progress classifier. It accepts the explicit
+    # finish action but never fabricates or dispatches the missing write.
+    assert result.termination_reason == "model_completed"
+    assert result.submission["tool_calls"] == []
+
+
+def test_invalid_finish_is_rejected_locally_and_feedback_allows_correction(tmp_path) -> None:
+    allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
+    session = FakeSession(allowed)
+    source, client = _source(
+        _tool_response("bad_finish", "agent__finish", {"status": "done"}),
+        _finish_response(reason="corrected"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "finish fixture", source)
+
+    assert [step.status for step in result.steps] == ["invalid_finish", "agent_finished"]
+    assert session.calls == []
+    correction_feedback = [
+        message for message in client.requests[1].messages if message["role"] == "tool"
+    ][-1]
+    assert "invalid_finish" in correction_feedback["content"]
+
+
+def test_multiple_tool_calls_including_finish_are_rejected_atomically(tmp_path) -> None:
+    allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
+    session = FakeSession(allowed)
+    source, client = _source(
+        ModelResponse(
+            tool_calls=(
+                ModelToolCall("read", "alarm__list", "{}"),
+                ModelToolCall(
+                    "finish", "agent__finish", '{"status":"done","reason":"too early"}'
+                ),
+            )
+        ),
+        _tool_response("read_retry", "alarm__list", {}),
+        _finish_response(reason="read complete"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "list alarms", source)
+
+    assert [step.status for step in result.steps] == [
+        "model_bad_output",
+        "read_succeeded",
+        "agent_finished",
+    ]
+    assert session.calls == [{"name": "alarm.list", "arguments": {}}]
+    correction = [message for message in client.requests[1].messages if message["role"] == "user"][-1]
+    assert "none were executed" in correction["content"]
+
+
+def test_free_text_json_is_no_longer_a_completion_protocol(tmp_path) -> None:
+    source, _ = _source(
+        ModelResponse(content='{"status":"done","reason":"legacy"}'),
+        max_invalid_proposals=0,
+    )
+    result = Runtime(
+        make_dataset(tmp_path),
+        session_factory=FakeFactory(
+            FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+        ),
+    ).run("public_test_1", "list", source)
+
+    assert result.termination_reason == "model_bad_output_limit"
+    assert result.steps[0].error == "model returned no tool call; use agent.finish to terminate"
+
+
+def test_duplicate_write_feedback_gets_one_corrective_finish_turn(tmp_path) -> None:
+    allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
+    session = FakeSession(allowed)
+    write = _tool_response("write", "alarm__create", {"time": "07:00"})
+    duplicate = _tool_response("duplicate", "alarm__create", {"time": "07:00"})
+    source, client = _source(write, duplicate, _finish_response(reason="already complete"))
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "create an alarm", source)
+
+    assert result.termination_reason == "model_completed"
+    assert [step.status for step in result.steps] == [
+        "write_succeeded",
+        "duplicate_write_rejected",
+        "agent_finished",
+    ]
+    assert session.calls == [{"name": "alarm.create", "arguments": {"time": "07:00"}}]
+    feedback = [message for message in client.requests[2].messages if message["role"] == "tool"][-1]
+    assert "already_executed" in feedback["content"]
+    assert "agent.finish" in feedback["content"]
+
+
+def test_duplicate_recovery_allows_only_one_corrective_model_turn(tmp_path) -> None:
+    allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
+    session = FakeSession(allowed)
+    source, client = _source(
+        _tool_response("write", "alarm__create", {"time": "07:00"}),
+        _tool_response("duplicate", "alarm__create", {"time": "07:00"}),
+        ModelResponse(content="still not a tool call"),
+        _finish_response(reason="must not be requested"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "create an alarm", source)
+
+    assert result.termination_reason == "duplicate_recovery_exhausted"
+    assert len(client.requests) == 3
+    assert len(session.calls) == 1

@@ -27,8 +27,9 @@ from lifemate.model import (
     ModelToolCall,
     OpenAICompatibleClient,
     RetrySettings,
+    ScriptedModelClient,
 )
-from lifemate.runtime import ExplicitActionSource, Runtime
+from lifemate.runtime import ExplicitActionSource, Runtime, ToolAction
 from tests.support import FakeFactory, FakeSession, make_dataset
 
 
@@ -159,7 +160,13 @@ def test_multiple_agent_steps_receive_one_diminishing_deadline(tmp_path: Path) -
             self.index += 1
             if self.index == 1:
                 return ModelResponse(tool_calls=(ModelToolCall("read", "alarm__list", "{}"),))
-            return ModelResponse(content='{"status":"done","reason":"complete"}')
+            return ModelResponse(
+                tool_calls=(
+                    ModelToolCall(
+                        "finish", "agent__finish", '{"status":"done","reason":"complete"}'
+                    ),
+                )
+            )
 
     dataset = make_dataset(tmp_path)
     factory = FakeFactory(FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"}))
@@ -210,6 +217,57 @@ def test_model_timeout_is_capped_and_retry_stops_when_budget_is_insufficient() -
             )
         )
     assert transport.timeouts == [1.0]
+
+
+def test_insufficient_remaining_time_prevents_new_model_request(tmp_path: Path) -> None:
+    fake_time = FakeTime()
+    client = ScriptedModelClient(
+        [ModelResponse(tool_calls=(ModelToolCall("read", "alarm__list", "{}"),))]
+    )
+    deadline = SampleDeadline.start(0.2, clock=fake_time.clock)
+    source = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture"),
+        deadline=deadline,
+        minimum_model_time_seconds=0.25,
+    )
+    dataset = make_dataset(tmp_path)
+
+    result = Runtime(
+        dataset,
+        session_factory=FakeFactory(
+            FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+        ),
+    ).run("public_test_1", "list alarms", source, deadline=deadline)
+
+    assert result.termination_reason == "sample_timeout"
+    assert client.requests == []
+
+
+def test_deadline_after_successful_write_preserves_official_trace(tmp_path: Path) -> None:
+    fake_time = FakeTime()
+    dataset = make_dataset(tmp_path)
+
+    def slow_success(_name, _arguments):
+        fake_time.advance(3.0)
+        return {"ok": True}
+
+    session = FakeSession(
+        {"alarm.list", "alarm.create", "sys.ask_missing_info"}, call=slow_success
+    )
+    deadline = SampleDeadline.start(2.0, clock=fake_time.clock)
+    result = Runtime(dataset, session_factory=FakeFactory(session)).run(
+        "public_test_1",
+        "create alarm",
+        ExplicitActionSource([ToolAction("alarm.create", {"time": "07:00"})]),
+        deadline=deadline,
+    )
+
+    assert result.termination_reason == "sample_timeout"
+    assert result.submission["tool_calls"] == [
+        {"name": "alarm.create", "arguments": {"time": "07:00"}}
+    ]
+    assert result.submission["state_hash"] == "official-hash"
 
 
 def test_fixed_seed_repeats_python_numpy_and_torch_configuration(monkeypatch) -> None:
@@ -298,7 +356,7 @@ def test_inference_sources_do_not_access_prohibited_environment_paths() -> None:
 def test_cli_compatibility_and_competition_defaults() -> None:
     batch = build_batch_parser().parse_args(["--output", "outputs/submission.jsonl"])
     assert batch.competition_mode is False
-    assert batch.sample_timeout_seconds is None
+    assert batch.sample_timeout_seconds == 28.0
     assert batch.seed == 42
 
     competition = build_batch_parser().parse_args(
@@ -314,7 +372,7 @@ def test_cli_compatibility_and_competition_defaults() -> None:
 
     single = build_parser().parse_args(["--sample-id", "public_0001", "--transcript", "debug"])
     assert single.seed == 42
-    assert single.sample_timeout_seconds is None
+    assert single.sample_timeout_seconds == 28.0
 
     with pytest.raises(SystemExit, match="2"):
         main(

@@ -17,6 +17,8 @@ from .asr import CachedTranscriber, Qwen3ASRSettings, Qwen3ASRTranscriber
 from .audio_pipeline import AudioInferencePipeline
 from .batch import BatchConfig, BatchError, BatchRunner, load_transcript_file
 from .compliance import (
+    DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS,
+    HARD_SAMPLE_TIMEOUT_SECONDS,
     SampleDeadline,
     SampleDeadlineExceeded,
     configure_reproducibility,
@@ -122,7 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-max-seconds", type=float, default=8.0)
     parser.add_argument("--max-invalid-proposals", type=int, default=2)
     parser.add_argument("--competition-mode", action="store_true")
-    parser.add_argument("--sample-timeout-seconds", type=float)
+    parser.add_argument(
+        "--sample-timeout-seconds", type=float, default=DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
+    )
+    parser.add_argument("--capture-raw-model-responses", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-deterministic", action="store_true")
     parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-1.7B")
@@ -185,7 +190,10 @@ def build_batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tool-calls", type=int, default=6)
     parser.add_argument("--max-invalid-proposals", type=int, default=2)
     parser.add_argument("--competition-mode", action="store_true")
-    parser.add_argument("--sample-timeout-seconds", type=float)
+    parser.add_argument(
+        "--sample-timeout-seconds", type=float, default=DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
+    )
+    parser.add_argument("--capture-raw-model-responses", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-deterministic", action="store_true")
     parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-1.7B")
@@ -217,6 +225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--transcript cannot be combined with --input-mode audio")
     if args.sample_timeout_seconds is not None and args.sample_timeout_seconds <= 0:
         parser.error("--sample-timeout-seconds must be positive")
+    if args.sample_timeout_seconds is not None and args.sample_timeout_seconds > HARD_SAMPLE_TIMEOUT_SECONDS:
+        parser.error("--sample-timeout-seconds cannot exceed the 30-second hard sample budget")
     if args.seed < 0:
         parser.error("--seed must be non-negative")
     if args.competition_mode and args.no_deterministic:
@@ -225,8 +235,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--competition-mode requires --temperature 0")
     configure_reproducibility(args.seed, deterministic=not args.no_deterministic)
     timeout = args.sample_timeout_seconds
-    if args.competition_mode and timeout is None:
-        timeout = 28.0
     deadline = SampleDeadline.start(timeout) if timeout is not None else None
     actions = list(args.action)
     if args.tool:
@@ -262,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             max_invalid_proposals=args.max_invalid_proposals,
             deadline=deadline,
+            capture_raw_responses=args.capture_raw_model_responses,
         )
     else:
         decisions = ExplicitActionSource(actions)
@@ -308,6 +317,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tool_calls_sent": result.tool_calls_sent,
         "model_usage": dict(result.model_usage) if result.model_usage is not None else None,
         "model_latency_seconds": result.model_latency_seconds,
+        "model_requests": [dict(item) for item in result.model_request_diagnostics],
+        "phase_timings": dict(result.phase_timings),
         "steps": [
             {
                 "index": step.index,
@@ -325,6 +336,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "backend": audio_result.final_transcription.backend,
             "detected_language": audio_result.final_transcription.language,
             "transcribed_turns": audio_result.diagnostics.transcribed_turns,
+            "initialization_latency_seconds": (
+                audio_result.diagnostics.initialization_latency_seconds
+            ),
             "final_audio_latency_seconds": audio_result.diagnostics.final_audio_latency_seconds,
             "history_audio_latency_seconds": audio_result.diagnostics.history_audio_latency_seconds,
             "cache_hits": audio_result.diagnostics.cache_hits,
@@ -347,6 +361,8 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         parser.error("--transcripts is only valid with batch --input-mode text")
     if args.sample_timeout_seconds is not None and args.sample_timeout_seconds <= 0:
         parser.error("--sample-timeout-seconds must be positive")
+    if args.sample_timeout_seconds is not None and args.sample_timeout_seconds > HARD_SAMPLE_TIMEOUT_SECONDS:
+        parser.error("--sample-timeout-seconds cannot exceed the 30-second hard sample budget")
     if args.seed < 0:
         parser.error("--seed must be non-negative")
     if args.competition_mode and args.no_deterministic:
@@ -385,6 +401,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
             client,
             inference_settings,
             max_invalid_proposals=args.max_invalid_proposals,
+            capture_raw_responses=args.capture_raw_model_responses,
         )
 
     dataset = DatasetReader(args.dataset_root, args.split)
@@ -444,17 +461,18 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         "max_steps": args.max_steps,
         "max_tool_calls": args.max_tool_calls,
         "max_invalid_proposals": args.max_invalid_proposals,
+        "capture_raw_model_responses": args.capture_raw_model_responses,
         "competition_mode": args.competition_mode,
         "sample_timeout_seconds": (
             args.sample_timeout_seconds
             if args.sample_timeout_seconds is not None
-            else (28.0 if args.competition_mode else None)
+            else DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
         ),
         "seed": args.seed,
         "deterministic": not args.no_deterministic,
         "asr": asr_identity,
         "text_transcripts": text_identity,
-        "agent_protocol_version": "phase04-v1",
+        "agent_protocol_version": "phase05-finish-v1",
     }
     try:
         summary = BatchRunner(

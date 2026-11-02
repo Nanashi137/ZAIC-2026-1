@@ -235,8 +235,9 @@ the API key. Development batch completion performs official schema validation.
 
 ## Phase 04.5 competition controls
 
-`--competition-mode` separates scored inference from development workflows. It defaults each sample to a 28-second
-`time.monotonic()` deadline, rejects non-local model URLs, seeds available Python/NumPy/PyTorch/CUDA runtimes with
+All single-sample and batch CLI inference defaults to a 28-second `time.monotonic()` cooperative deadline, leaving
+margin beneath the 30-second outer process watchdog. `--competition-mode` additionally rejects non-local model URLs,
+seeds available Python/NumPy/PyTorch/CUDA runtimes with
 seed 42, explicitly configures greedy ASR generation, and disables the post-batch official validator. The validator
 remains available in development mode or as a separate command, but it must not run inside scored inference because
 its CLI constructs another ToolEnv for each row.
@@ -251,6 +252,13 @@ generation. Cooperative checks can detect but cannot interrupt an overrun. `scri
 runs one scored sample in a dedicated child process and kills that process at the outer deadline. Wrapping an entire
 multi-sample batch in one watchdog is not equivalent. Phase 05 packaging must wire one child/watchdog per scored
 sample or an organizer-verified equivalent.
+
+Model termination is a native synthetic function call. The registry exposes provider-safe `agent__finish`, mapped to
+canonical internal action `agent.finish`; the runtime validates and intercepts it before official SDK validation or
+dispatch. Free-text JSON is no longer a completion protocol. Multiple native calls are rejected atomically so a
+write bundled with completion is never silently dropped or reordered. A repeated, SDK-confirmed identical write is
+also rejected before dispatch and receives one corrective turn with an instruction to finish. These internal actions
+never enter `env.get_tool_calls()`.
 
 ```powershell
 # Development: separate validator remains enabled.

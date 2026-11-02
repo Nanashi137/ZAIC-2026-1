@@ -10,6 +10,7 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 | 03 | Qwen3-ASR + conversation history | Audio and audio history reach agent correctly; reproducible ASR tests | COMPLETE (2026-11-01) |
 | 04 | Batch submission + diagnostics | Dynamic sample coverage, structural validator and official SDK schema validation | COMPLETE (2026-11-01) |
 | 04.5 | Competition compliance + runtime hardening | 28 s competition deadline, deterministic controls, one-ToolEnv scored path, compliance tests | COMPLETE (2026-11-01) |
+| 04.6 | Agent termination + duplicate recovery | Synthetic finish protocol, bounded duplicate recovery, default whole-sample budget, diagnostics | COMPLETE (2026-11-02) |
 | 05 | Optimize + packaging | Repeatable experiment comparisons, selected configuration, private packaging only once rules verified | TODO |
 
 **Implementation order:** 00 → 01 → 02 → 03 → 04 → 04.5 → 05. You may implement the batch writer earlier if needed; keep milestone acceptance independent.
@@ -31,6 +32,9 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 - **Confirmed:** Phase 04.5 competition mode defaults to a 28-second monotonic sample budget, disables in-process post-batch official validation, rejects non-local model endpoints, seeds available Python/NumPy/PyTorch/CUDA runtimes, and explicitly configures greedy ASR decoding.
 - **Confirmed:** cooperative deadline checks and model request timeout/retry caps cannot interrupt the official `qwen-asr` synchronous CUDA call. `scripts/competition_watchdog.py` is the required outer process boundary for a hard stop; Phase 05 packaging must invoke it once per scored sample.
 - **Confirmed:** production modules do not construct, probe, read, or parse `<split>_environment` paths and expose no `get_state()` call. Only the organizer's `ToolEnv` loads app state. Competition mode creates one inference ToolEnv and skips the validator that would create another.
+- **Confirmed:** model completion uses the internal `agent.finish` action (provider-safe name `agent__finish`), which is intercepted before official validation/dispatch and never appears in the SDK trace or submission.
+- **Confirmed:** an SDK-confirmed duplicate write is rejected locally and receives at most one corrective model turn; uncertain writes still stop without retry. Explicitly requested identical repetition is conservatively recognized from the transcript.
+- **Confirmed:** normal single-sample and batch CLI runs now default to a 28-second monotonic cooperative deadline, capped below the 30-second per-sample watchdog boundary. Per-request token usage and phase timings are checkpointed; raw malformed responses are opt-in.
 - **Unverified:** exact scoring details/weights, model/API/network rules, and the private Docker execution contract.
 - **Next:** Phase 05 must implement/package the fully offline local LLM and wire the per-sample outer watchdog into the organizer-facing entrypoint. Do not run paid full-scale inference without authorization.
 

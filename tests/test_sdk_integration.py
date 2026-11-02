@@ -77,7 +77,8 @@ def test_all_catalog_tools_have_openai_compatible_roots_and_contacts_update_keep
     catalog = dataset.load_catalog()
     registry = ModelToolRegistry.from_allowed(catalog.tools)
 
-    assert len(registry.definitions) == len(catalog.tools) == 122
+    assert len(catalog.tools) == 122
+    assert len(registry.definitions) == 123
     for definition in registry.definitions:
         parameters = definition["function"]["parameters"]
         assert parameters["type"] == "object"
@@ -129,7 +130,13 @@ def test_real_sdk_scripted_model_loop_uses_dynamic_tools_and_official_outputs() 
     client = ScriptedModelClient(
         [
             ModelResponse(tool_calls=(ModelToolCall("read_alarm", "alarm__list", "{}"),)),
-            ModelResponse(content='{"status":"done","reason":"alarms listed"}'),
+            ModelResponse(
+                tool_calls=(
+                    ModelToolCall(
+                        "finish", "agent__finish", '{"status":"done","reason":"alarms listed"}'
+                    ),
+                )
+            ),
         ]
     )
     source = LlmDecisionSource(client, InferenceSettings(model="offline-scripted"))
@@ -146,6 +153,7 @@ def test_real_sdk_scripted_model_loop_uses_dynamic_tools_and_official_outputs() 
     first_tools = {tool["function"]["name"] for tool in client.requests[0].tools}
     assert "alarm__list" in first_tools
     assert "sys__ask_missing_info" in first_tools
+    assert "agent__finish" in first_tools
 
 
 def test_audio_history_pipeline_uses_real_toolenv_without_replaying_history() -> None:

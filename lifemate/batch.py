@@ -12,14 +12,20 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
 
 from .asr import Transcriber
 from .audio_pipeline import AudioInferencePipeline
-from .compliance import SampleDeadline, SampleDeadlineExceeded, configure_reproducibility
+from .compliance import (
+    DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS,
+    HARD_SAMPLE_TIMEOUT_SECONDS,
+    SampleDeadline,
+    SampleDeadlineExceeded,
+    configure_reproducibility,
+)
 from .data import DatasetReader, Sample
 from .runtime import DecisionSource, RunResult, Runtime
 
@@ -54,7 +60,7 @@ class BatchConfig:
     workers: int = 1
     validate_official: bool = True
     competition_mode: bool = False
-    sample_timeout_seconds: float | None = None
+    sample_timeout_seconds: float | None = DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
     seed: int = 42
     deterministic: bool = True
 
@@ -67,12 +73,19 @@ class BatchConfig:
             raise ValueError("workers must be positive")
         if self.sample_timeout_seconds is not None and self.sample_timeout_seconds <= 0:
             raise ValueError("sample_timeout_seconds must be positive")
+        if (
+            self.sample_timeout_seconds is not None
+            and self.sample_timeout_seconds > HARD_SAMPLE_TIMEOUT_SECONDS
+        ):
+            raise ValueError("sample_timeout_seconds cannot exceed the hard sample budget")
         if self.seed < 0:
             raise ValueError("seed must be non-negative")
         if self.competition_mode:
             object.__setattr__(self, "validate_official", False)
             if self.sample_timeout_seconds is None:
-                object.__setattr__(self, "sample_timeout_seconds", 28.0)
+                object.__setattr__(
+                    self, "sample_timeout_seconds", DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
+                )
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,7 @@ class BatchSampleRecord:
     elapsed_seconds: float
     model_latency_seconds: float
     asr_inference_seconds: float
+    asr_initialization_seconds: float
     asr_cache_hits: int
     transcribed_turns: int
     model_requests: int
@@ -112,6 +126,8 @@ class BatchSampleRecord:
     output_tokens: int
     total_tokens: int
     step_statuses: tuple[str, ...]
+    model_request_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    phase_timings: Mapping[str, float] = field(default_factory=dict)
 
     def as_json(self) -> dict[str, Any]:
         value = asdict(self)
@@ -128,6 +144,7 @@ class BatchSampleRecord:
             elapsed_seconds=float(value["elapsed_seconds"]),
             model_latency_seconds=float(value["model_latency_seconds"]),
             asr_inference_seconds=float(value["asr_inference_seconds"]),
+            asr_initialization_seconds=float(value.get("asr_initialization_seconds", 0.0)),
             asr_cache_hits=int(value["asr_cache_hits"]),
             transcribed_turns=int(value["transcribed_turns"]),
             model_requests=int(value["model_requests"]),
@@ -135,6 +152,15 @@ class BatchSampleRecord:
             output_tokens=int(value["output_tokens"]),
             total_tokens=int(value["total_tokens"]),
             step_statuses=tuple(str(item) for item in value["step_statuses"]),
+            model_request_diagnostics=tuple(
+                dict(item)
+                for item in value.get("model_request_diagnostics", [])
+                if isinstance(item, Mapping)
+            ),
+            phase_timings={
+                str(key): float(item)
+                for key, item in dict(value.get("phase_timings", {})).items()
+            },
         )
 
 
@@ -149,6 +175,7 @@ class BatchFailureRecord:
     step_statuses: tuple[str, ...] = ()
     model_latency_seconds: float = 0.0
     asr_inference_seconds: float = 0.0
+    asr_initialization_seconds: float = 0.0
     asr_cache_hits: int = 0
     transcribed_turns: int = 0
     model_requests: int = 0
@@ -156,6 +183,9 @@ class BatchFailureRecord:
     output_tokens: int = 0
     total_tokens: int = 0
     tool_calls_sent: int = 0
+    model_request_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    step_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    phase_timings: Mapping[str, float] = field(default_factory=dict)
 
     def as_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -174,6 +204,7 @@ class BatchFailureRecord:
             step_statuses=tuple(str(item) for item in value.get("step_statuses", [])),
             model_latency_seconds=float(value.get("model_latency_seconds", 0.0)),
             asr_inference_seconds=float(value.get("asr_inference_seconds", 0.0)),
+            asr_initialization_seconds=float(value.get("asr_initialization_seconds", 0.0)),
             asr_cache_hits=int(value.get("asr_cache_hits", 0)),
             transcribed_turns=int(value.get("transcribed_turns", 0)),
             model_requests=int(value.get("model_requests", 0)),
@@ -181,6 +212,20 @@ class BatchFailureRecord:
             output_tokens=int(value.get("output_tokens", 0)),
             total_tokens=int(value.get("total_tokens", 0)),
             tool_calls_sent=int(value.get("tool_calls_sent", 0)),
+            model_request_diagnostics=tuple(
+                dict(item)
+                for item in value.get("model_request_diagnostics", [])
+                if isinstance(item, Mapping)
+            ),
+            step_diagnostics=tuple(
+                dict(item)
+                for item in value.get("step_diagnostics", [])
+                if isinstance(item, Mapping)
+            ),
+            phase_timings={
+                str(key): float(item)
+                for key, item in dict(value.get("phase_timings", {})).items()
+            },
         )
 
 
@@ -384,6 +429,9 @@ class BatchRunner:
                     audio_result.diagnostics.final_audio_latency_seconds
                     + audio_result.diagnostics.history_audio_latency_seconds
                 )
+                asr_initialization_seconds = (
+                    audio_result.diagnostics.initialization_latency_seconds
+                )
                 cache_hits = audio_result.diagnostics.cache_hits
                 transcribed_turns = audio_result.diagnostics.transcribed_turns
             else:
@@ -393,6 +441,7 @@ class BatchRunner:
                     raise ValueError(f"no text transcript supplied for {sample.id}")
                 run = self.runtime.run(sample.id, transcript, decisions, deadline=deadline)
                 asr_seconds = 0.0
+                asr_initialization_seconds = 0.0
                 cache_hits = 0
                 transcribed_turns = 0
             if run.termination_reason in _FAILED_TERMINATIONS:
@@ -402,6 +451,7 @@ class BatchRunner:
                     run,
                     self.clock() - started,
                     asr_seconds,
+                    asr_initialization_seconds,
                     cache_hits,
                     transcribed_turns,
                 )
@@ -411,6 +461,7 @@ class BatchRunner:
                 run,
                 self.clock() - started,
                 asr_seconds,
+                asr_initialization_seconds,
                 cache_hits,
                 transcribed_turns,
             )
@@ -519,10 +570,14 @@ def _sample_record(
     run: RunResult,
     elapsed_seconds: float,
     asr_seconds: float,
+    asr_initialization_seconds: float,
     cache_hits: int,
     transcribed_turns: int,
 ) -> BatchSampleRecord:
     usage = dict(run.model_usage or {})
+    phase_timings = _batch_phase_timings(
+        run, elapsed_seconds, asr_seconds, asr_initialization_seconds
+    )
     return BatchSampleRecord(
         id=sample.id,
         index=index,
@@ -531,6 +586,7 @@ def _sample_record(
         elapsed_seconds=elapsed_seconds,
         model_latency_seconds=run.model_latency_seconds or 0.0,
         asr_inference_seconds=asr_seconds,
+        asr_initialization_seconds=asr_initialization_seconds,
         asr_cache_hits=cache_hits,
         transcribed_turns=transcribed_turns,
         model_requests=int(usage.get("requests", 0)),
@@ -538,6 +594,8 @@ def _sample_record(
         output_tokens=int(usage.get("output_tokens", 0)),
         total_tokens=int(usage.get("total_tokens", 0)),
         step_statuses=tuple(step.status for step in run.steps),
+        model_request_diagnostics=tuple(dict(item) for item in run.model_request_diagnostics),
+        phase_timings=phase_timings,
     )
 
 
@@ -547,10 +605,14 @@ def _failure_from_run(
     run: RunResult,
     elapsed_seconds: float,
     asr_seconds: float,
+    asr_initialization_seconds: float,
     cache_hits: int,
     transcribed_turns: int,
 ) -> BatchFailureRecord:
     usage = dict(run.model_usage or {})
+    phase_timings = _batch_phase_timings(
+        run, elapsed_seconds, asr_seconds, asr_initialization_seconds
+    )
     step_errors = [step.error for step in run.steps if step.error]
     detail = f": {step_errors[-1]}" if step_errors else ""
     return BatchFailureRecord(
@@ -563,6 +625,7 @@ def _failure_from_run(
         step_statuses=tuple(step.status for step in run.steps),
         model_latency_seconds=run.model_latency_seconds or 0.0,
         asr_inference_seconds=asr_seconds,
+        asr_initialization_seconds=asr_initialization_seconds,
         asr_cache_hits=cache_hits,
         transcribed_turns=transcribed_turns,
         model_requests=int(usage.get("requests", 0)),
@@ -570,6 +633,52 @@ def _failure_from_run(
         output_tokens=int(usage.get("output_tokens", 0)),
         total_tokens=int(usage.get("total_tokens", 0)),
         tool_calls_sent=run.tool_calls_sent,
+        model_request_diagnostics=tuple(dict(item) for item in run.model_request_diagnostics),
+        step_diagnostics=_step_diagnostics(run),
+        phase_timings=phase_timings,
+    )
+
+
+def _batch_phase_timings(
+    run: RunResult,
+    elapsed_seconds: float,
+    asr_seconds: float,
+    asr_initialization_seconds: float,
+) -> dict[str, float]:
+    timings = {str(key): float(value) for key, value in run.phase_timings.items()}
+    timings["asr_inference_seconds"] = asr_seconds
+    timings["asr_initialization_seconds"] = asr_initialization_seconds
+    timings["sample_wall_seconds"] = elapsed_seconds
+    accounted = (
+        asr_initialization_seconds
+        + asr_seconds
+        + float(timings.get("agent_total_seconds", 0.0))
+    )
+    timings["pipeline_overhead_seconds"] = max(0.0, elapsed_seconds - accounted)
+    return timings
+
+
+def _step_diagnostics(run: RunResult) -> tuple[Mapping[str, Any], ...]:
+    local_statuses = {
+        "model_bad_output",
+        "model_bad_output_limit",
+        "permission_rejected",
+        "schema_rejected",
+        "invalid_finish",
+        "agent_finished",
+        "duplicate_write_rejected",
+        "sample_timeout",
+    }
+    return tuple(
+        {
+            "step_index": step.index,
+            "selected_tool": step.action.name if step.action is not None else None,
+            "status": step.status,
+            "sdk_invoked": step.action is not None and step.status not in local_statuses,
+            "validation_ok": step.validation.get("ok") if step.validation is not None else None,
+            "error": step.error,
+        }
+        for step in run.steps
     )
 
 
@@ -638,6 +747,7 @@ def build_metrics(
         "sdk_tool_errors": statuses["sdk_rejected"] + statuses["tool_error"],
         "uncertain_executions": statuses["execution_uncertain"],
         "no_op_tool_calls": statuses["no_op"],
+        "duplicate_writes_rejected": statuses["duplicate_write_rejected"],
         "clarification_requests": terminations["awaiting_user"],
         "unsupported_requests": terminations["unsupported_request"],
         "termination_reasons": dict(sorted(terminations.items())),
@@ -645,6 +755,12 @@ def build_metrics(
         "asr_inference_seconds": {
             "total": sum(record.asr_inference_seconds for record in all_outcomes),
             "average_per_processed": _average([record.asr_inference_seconds for record in all_outcomes]),
+        },
+        "asr_initialization_seconds": {
+            "total": sum(record.asr_initialization_seconds for record in all_outcomes),
+            "average_per_processed": _average(
+                [record.asr_initialization_seconds for record in all_outcomes]
+            ),
         },
         "asr_transcribed_turns": sum(record.transcribed_turns for record in all_outcomes),
         "asr_cache_hits": sum(record.asr_cache_hits for record in all_outcomes),
@@ -759,6 +875,7 @@ _FAILED_TERMINATIONS = frozenset(
         "max_steps_exhausted",
         "tool_call_budget_exhausted",
         "duplicate_write_blocked",
+        "duplicate_recovery_exhausted",
         "execution_uncertain",
         "sdk_rejected",
         "tool_error",

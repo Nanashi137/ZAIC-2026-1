@@ -13,6 +13,7 @@ from typing import Any
 from .compliance import SampleDeadline
 from .model import InferenceSettings, ModelClient, ModelClientError, ModelRequest, ModelResponse, ModelUsage
 from .runtime import (
+    AGENT_FINISH,
     BadDecisionOutput,
     DecisionContext,
     DecisionModelError,
@@ -24,6 +25,17 @@ from .runtime import (
 from .tool_schema import ToolSchemaCompatibilityError, adapt_function_parameters
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+_FINISH_PARAMETERS: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "unsupported"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["status", "reason"],
+    "additionalProperties": False,
+}
+
+
 @dataclass(frozen=True)
 class ModelToolRegistry:
     definitions: tuple[Mapping[str, Any], ...]
@@ -58,6 +70,23 @@ class ModelToolRegistry:
                     },
                 }
             )
+        finish_model_name = _unique_model_name(AGENT_FINISH, model_to_official)
+        model_to_official[finish_model_name] = AGENT_FINISH
+        official_to_model[AGENT_FINISH] = finish_model_name
+        definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": finish_model_name,
+                    "description": (
+                        "Internal controller action agent.finish. Call it immediately when no further official "
+                        "tool calls are required. It is never sent to the application SDK."
+                    ),
+                    "parameters": _FINISH_PARAMETERS,
+                    "strict": True,
+                },
+            }
+        )
         return cls(tuple(definitions), model_to_official, official_to_model)
 
 
@@ -76,12 +105,9 @@ class ContextBuilder:
             "location": _jsonable(sample.context.get("location")),
             "user_profile": _jsonable(sample.context.get("user_profile")),
         }
+        finish_model_name = registry.official_to_model[AGENT_FINISH]
         history_source = context.conversation_history if context.conversation_history is not None else sample.history
         history = [_history_turn(turn) for turn in history_source]
-        name_map = [
-            {"model_name": model_name, "official_name": official_name}
-            for model_name, official_name in sorted(registry.model_to_official.items())
-        ]
         system = (
             "You are a Vietnamese voice-to-action planner for the LifeMate competition. "
             "Choose only from the provided functions. "
@@ -89,11 +115,15 @@ class ContextBuilder:
             "Use read tools before writes whenever an ID/reference must come from app data. Never invent IDs. "
             "After every function call, inspect the actual observation before deciding the next step. "
             "An observation with ok=true and done=false is a no-op, not success. "
+            "After a write succeeds, do not repeat that operation unless the user explicitly requested another "
+            "distinct execution. A subsequent read does not invalidate an earlier successful write. "
+            f"When all requested actions are complete, immediately call {finish_model_name} "
+            "(the internal action agent.finish). If more actions are required, "
+            "continue with those actions. Do not produce free-text JSON to terminate the task. "
             "If required user information is missing, call the provided sys.ask_missing_info function "
             "with exact schema "
-            "parameter names. If no available tool can satisfy the request, do not call a tool. "
-            "When finished without a function call, return only JSON: "
-            '{"status":"done","reason":"..."} or {"status":"unsupported","reason":"..."}. '
+            "parameter names. If no available official tool can satisfy the request, call agent.finish with "
+            "status unsupported. Never claim an action succeeded unless confirmed by the SDK. "
             "Do not reveal chain-of-thought; make only the next tool decision or the final status."
         )
         user_payload = {
@@ -103,7 +133,6 @@ class ContextBuilder:
             "final_user_transcript_source": (
                 "qwen3_asr" if context.conversation_history is not None else "debug_override"
             ),
-            "tool_name_map": name_map,
         }
         return [
             {"role": "system", "content": system},
@@ -122,10 +151,14 @@ class LlmDecisionSource:
         context_builder: ContextBuilder | None = None,
         max_invalid_proposals: int = 2,
         deadline: SampleDeadline | None = None,
+        capture_raw_responses: bool = False,
+        minimum_model_time_seconds: float = 0.25,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         if max_invalid_proposals < 0:
             raise ValueError("max_invalid_proposals must be non-negative")
+        if minimum_model_time_seconds < 0:
+            raise ValueError("minimum_model_time_seconds must be non-negative")
         self.client = client
         self.settings = settings
         self.context_builder = context_builder or ContextBuilder()
@@ -140,6 +173,10 @@ class LlmDecisionSource:
         self._clock = clock
         self._latency_seconds = 0.0
         self._deadline = deadline
+        self._capture_raw_responses = capture_raw_responses
+        self._minimum_model_time_seconds = minimum_model_time_seconds
+        self._request_diagnostics: list[dict[str, Any]] = []
+        self._active_diagnostic: dict[str, Any] | None = None
 
     @property
     def usage(self) -> Mapping[str, int]:
@@ -148,6 +185,10 @@ class LlmDecisionSource:
     @property
     def latency_seconds(self) -> float:
         return self._latency_seconds
+
+    @property
+    def request_diagnostics(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(dict(item) for item in self._request_diagnostics)
 
     def set_deadline(self, deadline: SampleDeadline) -> None:
         """Attach the batch-created deadline before the first model turn."""
@@ -158,12 +199,20 @@ class LlmDecisionSource:
 
     def next_action(self, context: DecisionContext) -> ToolAction | None:
         if self._deadline is not None:
-            self._deadline.check("agent model step")
+            self._deadline.require_duration(self._minimum_model_time_seconds, "agent model step")
         if self._messages is None:
             self._registry = ModelToolRegistry.from_allowed(context.allowed_tools)
             self._messages = self.context_builder.initial_messages(context, self._registry)
         self._append_new_step_feedback(context.steps)
         assert self._registry is not None
+        remaining_before = self._deadline.remaining_seconds() if self._deadline is not None else None
+        diagnostic: dict[str, Any] = {
+            "sample_id": context.sample.id,
+            "step_index": len(context.steps),
+            "remaining_seconds_before": remaining_before,
+        }
+        self._request_diagnostics.append(diagnostic)
+        self._active_diagnostic = diagnostic
         started = self._clock()
         try:
             response = self.client.complete(
@@ -175,29 +224,49 @@ class LlmDecisionSource:
                 )
             )
         except ModelClientError as exc:
+            diagnostic.update({"response_type": "model_error", "validation_failure": type(exc).__name__})
             raise DecisionModelError(str(exc)) from exc
         finally:
             self._latency_seconds += self._clock() - started
+            diagnostic["remaining_seconds_after"] = (
+                self._deadline.remaining_seconds() if self._deadline is not None else None
+            )
         self._usage = self._usage + response.usage
-        return self._parse_response(response)
+        diagnostic.update(
+            {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+                "response_type": _response_type(response),
+                "selected_tools": [call.name for call in response.tool_calls],
+            }
+        )
+        try:
+            return self._parse_response(response)
+        finally:
+            self._active_diagnostic = None
 
     def _parse_response(self, response: ModelResponse) -> ToolAction | None:
         assert self._messages is not None and self._registry is not None
         if response.refusal:
+            self._record_invalid("refusal", response)
             raise DecisionRefusal(response.refusal)
         if len(response.tool_calls) > 1:
-            self._remember_invalid_response(response)
-            self._bad_output("model returned multiple tool calls; sequential mode requires at most one")
+            self._record_invalid("multiple_tool_calls", response)
+            self._bad_output(
+                "model returned multiple tool calls; none were executed. Sequential mode requires exactly one "
+                "next action, and agent.finish must be emitted only after all official operations complete"
+            )
         if response.tool_calls:
             call = response.tool_calls[0]
             try:
                 arguments = json.loads(call.arguments)
             except json.JSONDecodeError as exc:
-                self._remember_invalid_response(response)
+                self._record_invalid("invalid_tool_arguments_json", response)
                 self._bad_output(f"tool arguments are invalid JSON: {exc.msg}")
                 raise AssertionError("unreachable") from exc
             if not isinstance(arguments, dict):
-                self._remember_invalid_response(response)
+                self._record_invalid("tool_arguments_not_object", response)
                 self._bad_output("tool arguments must decode to an object")
             self._invalid_proposals = 0
             self._messages.append(
@@ -214,6 +283,8 @@ class LlmDecisionSource:
                 }
             )
             official_name = self._registry.model_to_official.get(call.name, call.name)
+            if self._active_diagnostic is not None:
+                self._active_diagnostic["selected_tool"] = official_name
             return ToolAction(
                 official_name,
                 arguments,
@@ -221,32 +292,20 @@ class LlmDecisionSource:
                 model_name=call.name,
             )
 
-        if not response.content:
-            self._remember_invalid_response(response)
-            self._bad_output("model returned neither a tool call nor a final status")
-        try:
-            final = json.loads(response.content)
-        except json.JSONDecodeError as exc:
-            self._remember_invalid_response(response)
-            self._bad_output(f"final response is not JSON: {exc.msg}")
-            raise AssertionError("unreachable") from exc
-        if not isinstance(final, dict) or final.get("status") not in {"done", "unsupported"}:
-            self._remember_invalid_response(response)
-            self._bad_output("final response must have status done or unsupported")
-        self._invalid_proposals = 0
-        self._messages.append({"role": "assistant", "content": response.content})
-        self.finish_reason = "unsupported_request" if final["status"] == "unsupported" else "model_completed"
-        return None
+        self._record_invalid("missing_tool_call", response)
+        self._bad_output("model returned no tool call; use agent.finish to terminate")
+        raise AssertionError("unreachable")
 
     def _append_new_step_feedback(self, steps: Sequence[StepResult]) -> None:
         assert self._messages is not None
         for step in steps[self._reported_steps :]:
-            feedback = {
-                "status": step.status,
-                "validation": _jsonable(step.validation),
-                "observation": _jsonable(step.observation),
-                "error": step.error,
-            }
+            feedback: dict[str, Any] = {"status": step.status}
+            if step.validation is not None and not step.validation.get("ok"):
+                feedback["validation"] = _jsonable(step.validation)
+            if step.observation is not None:
+                feedback["observation"] = _jsonable(step.observation)
+            if step.error:
+                feedback["error"] = step.error
             if step.action is not None and step.action.provider_call_id:
                 self._messages.append(
                     {
@@ -265,8 +324,12 @@ class LlmDecisionSource:
                 )
         self._reported_steps = len(steps)
 
-    def _remember_invalid_response(self, response: ModelResponse) -> None:
+    def _record_invalid(self, category: str, response: ModelResponse) -> None:
         assert self._messages is not None
+        if self._active_diagnostic is not None:
+            self._active_diagnostic["validation_failure"] = category
+            if self._capture_raw_responses:
+                self._active_diagnostic["raw_model_response"] = _diagnostic_response(response)
         if response.content:
             self._messages.append({"role": "assistant", "content": response.content})
 
@@ -330,3 +393,24 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _response_type(response: ModelResponse) -> str:
+    if response.refusal:
+        return "refusal"
+    if response.tool_calls:
+        return "tool_calls"
+    if response.content:
+        return "text"
+    return "empty"
+
+
+def _diagnostic_response(response: ModelResponse) -> dict[str, Any]:
+    return {
+        "content": response.content,
+        "refusal": response.refusal,
+        "tool_calls": [
+            {"id": call.id, "name": call.name, "arguments": call.arguments}
+            for call in response.tool_calls
+        ],
+    }

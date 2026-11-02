@@ -188,14 +188,62 @@ def test_uncertain_write_execution_stops_without_retry_or_new_session(tmp_path) 
     assert len(factory.creations) == 1
 
 
-def test_identical_write_is_blocked_after_first_sdk_call(tmp_path) -> None:
+def test_identical_write_is_rejected_then_corrective_finish_succeeds(tmp_path) -> None:
     allowed = {"alarm.list", "alarm.create", "sys.ask_missing_info"}
     session = FakeSession(allowed)
     runtime, _ = _runtime(tmp_path, session)
     action = ToolAction("alarm.create", {"time": "07:00"})
 
-    result = runtime.run("public_test_1", "create alarm", ExplicitActionSource([action, action]))
+    result = runtime.run(
+        "public_test_1",
+        "create alarm",
+        ExplicitActionSource(
+            [
+                action,
+                action,
+                ToolAction("agent.finish", {"status": "done", "reason": "already created"}),
+            ]
+        ),
+    )
 
-    assert result.termination_reason == "duplicate_write_blocked"
-    assert [step.status for step in result.steps] == ["write_succeeded", "duplicate_write_blocked"]
+    assert result.termination_reason == "model_completed"
+    assert [step.status for step in result.steps] == [
+        "write_succeeded",
+        "duplicate_write_rejected",
+        "agent_finished",
+    ]
     assert session.calls == [{"name": "alarm.create", "arguments": {"time": "07:00"}}]
+
+
+def test_distinct_writes_are_not_deduplicated(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    runtime, _ = _runtime(tmp_path, session)
+
+    result = runtime.run(
+        "public_test_1",
+        "create two different alarms",
+        ExplicitActionSource(
+            [
+                ToolAction("alarm.create", {"time": "07:00"}),
+                ToolAction("alarm.create", {"time": "08:00"}),
+            ]
+        ),
+    )
+
+    assert [step.status for step in result.steps] == ["write_succeeded", "write_succeeded"]
+    assert len(session.calls) == 2
+
+
+def test_explicitly_requested_identical_repeat_is_allowed_twice(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    runtime, _ = _runtime(tmp_path, session)
+    action = ToolAction("alarm.create", {"time": "07:00"})
+
+    result = runtime.run(
+        "public_test_1",
+        "repeat it twice",
+        ExplicitActionSource([action, action]),
+    )
+
+    assert [step.status for step in result.steps] == ["write_succeeded", "write_succeeded"]
+    assert len(session.calls) == 2

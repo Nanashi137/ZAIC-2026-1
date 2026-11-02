@@ -9,6 +9,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+HARD_SAMPLE_TIMEOUT_SECONDS = 30.0
+DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS = 28.0
+
 
 class SampleDeadlineExceeded(TimeoutError):
     """The complete per-sample wall-clock budget has expired."""

@@ -17,6 +17,7 @@ from .runtime import DecisionSource, RunResult, Runtime
 @dataclass(frozen=True)
 class AudioRunDiagnostics:
     transcribed_turns: int
+    initialization_latency_seconds: float
     final_audio_latency_seconds: float
     history_audio_latency_seconds: float
     cache_hits: int
@@ -53,7 +54,9 @@ class AudioInferencePipeline:
         if deadline is not None:
             deadline.check("audio sample setup")
         sample = self.dataset.get_sample(sample_id)
+        initialization_before = _initialization_latency(self.transcriber)
         final = self.transcriber.transcribe(self._audio_path(sample.audio), deadline=deadline)
+        initialization_after = _initialization_latency(self.transcriber)
         history, history_results = self._transcribe_history(sample, deadline=deadline)
         run = self.runtime.run(
             sample.id,
@@ -71,6 +74,9 @@ class AudioInferencePipeline:
             conversation_history=history,
             diagnostics=AudioRunDiagnostics(
                 transcribed_turns=len(all_results),
+                initialization_latency_seconds=(
+                    initialization_after or 0.0 if initialization_before is None else 0.0
+                ),
                 final_audio_latency_seconds=final.inference_latency_seconds,
                 history_audio_latency_seconds=sum(
                     result.inference_latency_seconds for result in history_results if not result.cached
@@ -140,3 +146,18 @@ def _preserve(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_preserve(item) for item in value)
     return value
+
+
+def _initialization_latency(transcriber: Any) -> float | None:
+    current = transcriber
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        latency = getattr(current, "initialization_latency_seconds", None)
+        if isinstance(latency, (int, float)) and not isinstance(latency, bool) and latency >= 0:
+            return float(latency)
+        inner = getattr(current, "inner", None)
+        if inner is None:
+            break
+        current = inner
+    return None

@@ -16,7 +16,13 @@ from lifemate.batch import (
     validate_submission_records,
 )
 from lifemate.data import DatasetReader
-from lifemate.model import InferenceSettings, ModelResponse, ModelUsage, ScriptedModelClient
+from lifemate.model import (
+    InferenceSettings,
+    ModelResponse,
+    ModelToolCall,
+    ModelUsage,
+    ScriptedModelClient,
+)
 from lifemate.runtime import ExplicitActionSource, Runtime, ToolAction
 from tests.support import FakeSession
 
@@ -105,7 +111,11 @@ class AlwaysDoneClient:
     def complete(self, request):
         self.requests.append(request)
         return ModelResponse(
-            content='{"status":"done","reason":"fixture"}',
+            tool_calls=(
+                ModelToolCall(
+                    "finish", "agent__finish", '{"status":"done","reason":"fixture"}'
+                ),
+            ),
             usage=ModelUsage(10, 2, 12),
         )
 
@@ -266,9 +276,12 @@ def test_terminal_agent_failure_is_reported_without_submission_row(tmp_path: Pat
 
     def decisions(_sample):
         return LlmDecisionSource(
-            ScriptedModelClient([ModelResponse(content="not-json")]),
+            ScriptedModelClient(
+                [ModelResponse(content="not-json", usage=ModelUsage(11, 4, 15))]
+            ),
             InferenceSettings(model="fixture"),
             max_invalid_proposals=0,
+            capture_raw_responses=True,
         )
 
     summary = BatchRunner(
@@ -284,6 +297,9 @@ def test_terminal_agent_failure_is_reported_without_submission_row(tmp_path: Pat
     assert not output.exists()
     failure = json.loads(summary.failures.read_text(encoding="utf-8"))
     assert failure["termination_reason"] == "model_bad_output_limit"
+    assert failure["model_request_diagnostics"][0]["input_tokens"] == 11
+    assert failure["model_request_diagnostics"][0]["raw_model_response"]["content"] == "not-json"
+    assert failure["phase_timings"]["sample_wall_seconds"] >= 0
     metrics = json.loads(summary.metrics.read_text(encoding="utf-8"))
     assert metrics["invalid_model_proposals"] == 1
     assert metrics["termination_reasons"] == {"model_bad_output_limit": 1}

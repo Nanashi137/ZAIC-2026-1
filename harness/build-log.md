@@ -397,3 +397,54 @@ uv run --frozen python -m scripts.competition_watchdog --timeout-seconds 5 -- `
 The watchdog is the hard-stop mechanism for blocking CUDA calls; Python deadline checks alone are not described as
 cancellation. Phase 05 must provide the fully offline local LLM, export pre-interpreter environment settings, and wire
 one watchdog child per scored sample. No external API, model download, or real ASR inference was run for Phase 04.5.
+
+## Phase 04.6 evidence — synthetic completion and bounded duplicate recovery
+
+Implemented on 2026-11-02 after inspecting the installed SDK lifecycle and trace behavior again. The official
+`Session.call` appends every dispatched call before execution, while `Session.validate` records nothing. Therefore
+`agent.finish`, invalid finish actions, and locally rejected duplicates are intercepted before `Session.call`; actual
+SDK calls remain sourced unchanged from `env.get_tool_calls()` and `env.get_state_hash()`.
+
+Behavior changes:
+
+- provider-safe `agent__finish` maps to internal `agent.finish`; valid `done`/`unsupported` calls terminate locally;
+- free-text JSON completion is rejected and bounded by the existing invalid-proposal limit;
+- multi-call responses are rejected atomically and execute no bundled operation;
+- confirmed duplicate writes produce `duplicate_write_rejected` feedback and one corrective model turn;
+- uncertain writes are never retried, distinct writes remain executable, and explicit identical repeats are allowed
+  conservatively when the transcript says twice/repeat;
+- normal CLI and batch inference now default to a 28-second whole-sample cooperative deadline, with remaining-time
+  HTTP caps and the existing 30-second per-sample watchdog as the non-cooperative hard stop;
+- failures/checkpoints include per-request tokens, response category, selected tool, remaining budget, controller/SDK
+  step outcomes, ASR initialization separately from inference, and phase timings. Raw malformed responses require
+  `--capture-raw-model-responses`.
+
+Verification run from the repository root:
+
+```powershell
+uv run --frozen ruff check lifemate tests
+# All checks passed!
+
+uv run --frozen pytest -q
+# 72 passed in 2.38s
+
+uv run --frozen pytest -m integration -q
+# 6 passed, 66 deselected in 0.07s
+```
+
+The full suite includes real public-test SDK integration tests and confirms synthetic actions are excluded from the
+official trace.
+
+Live deterministic Qwen regressions were then run against the healthy local llama.cpp endpoint at
+`http://127.0.0.1:1990/v1`, each inside the 30-second watchdog, with the original 0.6B ASR cache/configuration:
+
+- `public_0002`: `read_succeeded -> write_succeeded -> agent_finished`; 3 model requests, 24,146 total tokens,
+  approximately 10.5 seconds command wall time. The official trace contains only quote/book calls.
+- `public_0005`: three reads, one successful write, another read, then `agent_finished`; 6 model requests, 58,784
+  total tokens, approximately 11.9 seconds wall time. No duplicate write reached the SDK.
+- `public_0006`: `read_succeeded -> agent_finished`; 2 model requests, 10,694 total tokens, approximately 7.8 seconds
+  wall time. The official trace contains only the read.
+
+All three terminated as `model_completed`; no synthetic finish appeared in any submission trace. These runs prove the
+termination, trace, and budget regressions, not semantic task accuracy. Cached ASR text remains noisy, and in
+particular `public_0006` may have finished before performing the intended conditional action.
