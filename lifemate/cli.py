@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "max_tokens", "max_completion_tokens"),
         default="auto",
     )
+    parser.add_argument("--tool-choice", choices=("auto", "required"), default="required")
     parser.add_argument("--requests-per-minute", type=float)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--retry-base-seconds", type=float, default=1.0)
@@ -178,6 +179,7 @@ def build_batch_parser() -> argparse.ArgumentParser:
         choices=("auto", "max_tokens", "max_completion_tokens"),
         default="auto",
     )
+    parser.add_argument("--tool-choice", choices=("auto", "required"), default="required")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
@@ -267,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 temperature=args.temperature,
                 max_output_tokens=args.max_output_tokens,
                 max_tokens_field=args.token_limit_field,
+                tool_choice=args.tool_choice,
             ),
             max_invalid_proposals=args.max_invalid_proposals,
             deadline=deadline,
@@ -394,6 +397,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         temperature=args.temperature,
         max_output_tokens=args.max_model_tokens,
         max_tokens_field=args.token_limit_field,
+        tool_choice=args.tool_choice,
     )
 
     def decisions(_sample):
@@ -458,6 +462,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         "temperature": args.temperature,
         "max_model_tokens": args.max_model_tokens,
         "token_limit_field": args.token_limit_field,
+        "tool_choice": args.tool_choice,
         "max_steps": args.max_steps,
         "max_tool_calls": args.max_tool_calls,
         "max_invalid_proposals": args.max_invalid_proposals,

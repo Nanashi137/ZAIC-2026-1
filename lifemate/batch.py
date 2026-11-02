@@ -28,6 +28,7 @@ from .compliance import (
 )
 from .data import DatasetReader, Sample
 from .runtime import DecisionSource, RunResult, Runtime
+from .sdk import ToolSession
 
 
 class BatchError(RuntimeError):
@@ -171,6 +172,7 @@ class BatchFailureRecord:
     error_type: str
     message: str
     elapsed_seconds: float
+    submission: Mapping[str, Any] | None = None
     termination_reason: str | None = None
     step_statuses: tuple[str, ...] = ()
     model_latency_seconds: float = 0.0
@@ -188,7 +190,9 @@ class BatchFailureRecord:
     phase_timings: Mapping[str, float] = field(default_factory=dict)
 
     def as_json(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value["submission"] = dict(self.submission) if self.submission is not None else None
+        return value
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> BatchFailureRecord:
@@ -198,6 +202,11 @@ class BatchFailureRecord:
             error_type=str(value["error_type"]),
             message=str(value["message"]),
             elapsed_seconds=float(value["elapsed_seconds"]),
+            submission=(
+                dict(value["submission"])
+                if isinstance(value.get("submission"), Mapping)
+                else None
+            ),
             termination_reason=(
                 str(value["termination_reason"]) if value.get("termination_reason") is not None else None
             ),
@@ -373,11 +382,21 @@ class BatchRunner:
                 executor.shutdown(wait=True, cancel_futures=True)
 
         ordered_records = [completed[sample.id] for sample in samples if sample.id in completed]
-        ready = not failures and len(ordered_records) == total
+        rows_by_id = {
+            sample_id: dict(record.submission) for sample_id, record in completed.items()
+        }
+        rows_by_id.update(
+            {
+                sample_id: dict(failure.submission)
+                for sample_id, failure in failures.items()
+                if failure.submission is not None
+            }
+        )
+        rows = [rows_by_id[sample.id] for sample in samples if sample.id in rows_by_id]
+        ready = len(rows) == total
         official_result: str | None = None
         output: Path | None = None
         if ready:
-            rows = [dict(record.submission) for record in ordered_records]
             validate_submission_records(rows, expected_ids)
             candidate = self.paths.output.with_name(f".{self.paths.output.name}.candidate")
             _write_jsonl(candidate, rows)
@@ -405,6 +424,12 @@ class BatchRunner:
 
     def _process_sample(self, sample: Sample) -> BatchSampleRecord | BatchFailureRecord:
         started = self.clock()
+        active_session: ToolSession | None = None
+
+        def remember_session(session: ToolSession) -> None:
+            nonlocal active_session
+            active_session = session
+
         deadline = (
             SampleDeadline.start(self.config.sample_timeout_seconds, clock=self.deadline_clock)
             if self.config.sample_timeout_seconds is not None
@@ -423,6 +448,7 @@ class BatchRunner:
                     sample.id,
                     decisions,
                     deadline=deadline,
+                    session_observer=remember_session,
                 )
                 run = audio_result.run
                 asr_seconds = (
@@ -439,7 +465,13 @@ class BatchRunner:
                 transcript = self.transcript_provider(sample)
                 if not transcript.strip():
                     raise ValueError(f"no text transcript supplied for {sample.id}")
-                run = self.runtime.run(sample.id, transcript, decisions, deadline=deadline)
+                run = self.runtime.run(
+                    sample.id,
+                    transcript,
+                    decisions,
+                    deadline=deadline,
+                    session_observer=remember_session,
+                )
                 asr_seconds = 0.0
                 asr_initialization_seconds = 0.0
                 cache_hits = 0
@@ -467,13 +499,38 @@ class BatchRunner:
             )
         except Exception as exc:
             termination = "sample_timeout" if isinstance(exc, SampleDeadlineExceeded) else None
+            submission: Mapping[str, Any] | None = None
+            fallback_error: Exception | None = None
+            try:
+                submission = dict(
+                    self.runtime.capture_submission(
+                        sample.id,
+                        session=active_session,
+                    )
+                )
+            except Exception as capture_exc:
+                fallback_error = capture_exc
+            message = str(exc)[:1000]
+            if fallback_error is not None:
+                fallback_detail = (
+                    f"; submission fallback failed: {type(fallback_error).__name__}: "
+                    f"{fallback_error}"
+                )
+                message = (message + fallback_detail)[:1000]
             return BatchFailureRecord(
                 id=sample.id,
                 index=self._sample_indexes.get(sample.id, -1),
                 error_type=type(exc).__name__,
-                message=str(exc)[:1000],
+                message=message,
                 elapsed_seconds=self.clock() - started,
+                submission=submission,
                 termination_reason=termination,
+                tool_calls_sent=(
+                    len(submission["tool_calls"])
+                    if submission is not None
+                    and isinstance(submission.get("tool_calls"), list)
+                    else 0
+                ),
             )
 
     def _prepare(
@@ -523,6 +580,13 @@ class BatchRunner:
                     raise BatchResumeError(f"duplicate failed sample in checkpoint: {failure.id}")
                 if failure.index < 0 or failure.index >= len(expected_ids) or expected_ids[failure.index] != failure.id:
                     raise BatchResumeError(f"failed checkpoint index mismatch for {failure.id}")
+                if failure.submission is not None:
+                    try:
+                        validate_submission_records([failure.submission], [failure.id])
+                    except SubmissionValidationError as exc:
+                        raise BatchResumeError(
+                            f"invalid degraded checkpoint for {failure.id}: {exc}"
+                        ) from exc
                 failures[failure.id] = failure
         unknown = (set(completed) | set(failures)) - set(expected_ids)
         if unknown:
@@ -621,6 +685,7 @@ def _failure_from_run(
         error_type="AgentTerminationFailure",
         message=f"agent terminated without a complete result: {run.termination_reason}{detail}",
         elapsed_seconds=elapsed_seconds,
+        submission=dict(run.submission),
         termination_reason=run.termination_reason,
         step_statuses=tuple(step.status for step in run.steps),
         model_latency_seconds=run.model_latency_seconds or 0.0,
@@ -667,6 +732,8 @@ def _step_diagnostics(run: RunResult) -> tuple[Mapping[str, Any], ...]:
         "invalid_finish",
         "agent_finished",
         "duplicate_write_rejected",
+        "duplicate_read_rejected",
+        "tool_call_budget_rejected",
         "sample_timeout",
     }
     return tuple(
@@ -738,6 +805,11 @@ def build_metrics(
         "total_samples": selected_samples,
         "completed_samples": len(records),
         "failed_samples": len(failures),
+        "degraded_submission_rows": sum(
+            failure.submission is not None for failure in failures.values()
+        ),
+        "submission_coverage_rows": len(records)
+        + sum(failure.submission is not None for failure in failures.values()),
         "samples_with_tool_calls": (
             sum(bool(record.submission["tool_calls"]) for record in records)
             + sum(failure.tool_calls_sent > 0 for failure in failures.values())
@@ -748,6 +820,8 @@ def build_metrics(
         "uncertain_executions": statuses["execution_uncertain"],
         "no_op_tool_calls": statuses["no_op"],
         "duplicate_writes_rejected": statuses["duplicate_write_rejected"],
+        "duplicate_reads_rejected": statuses["duplicate_read_rejected"],
+        "tool_budget_proposals_rejected": statuses["tool_call_budget_rejected"],
         "clarification_requests": terminations["awaiting_user"],
         "unsupported_requests": terminations["unsupported_request"],
         "termination_reasons": dict(sorted(terminations.items())),
@@ -876,6 +950,7 @@ _FAILED_TERMINATIONS = frozenset(
         "tool_call_budget_exhausted",
         "duplicate_write_blocked",
         "duplicate_recovery_exhausted",
+        "read_loop_exhausted",
         "execution_uncertain",
         "sdk_rejected",
         "tool_error",

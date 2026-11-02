@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -12,6 +12,7 @@ from .asr import Transcriber, TranscriptionResult
 from .compliance import SampleDeadline
 from .data import DatasetReader, Sample
 from .runtime import DecisionSource, RunResult, Runtime
+from .sdk import ToolSession
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class AudioInferencePipeline:
         decisions: DecisionSource,
         *,
         deadline: SampleDeadline | None = None,
+        session_observer: Callable[[ToolSession], None] | None = None,
     ) -> AudioRunResult:
         if deadline is not None:
             deadline.check("audio sample setup")
@@ -64,6 +66,7 @@ class AudioInferencePipeline:
             decisions,
             conversation_history=history,
             deadline=deadline,
+            session_observer=session_observer,
         )
         all_results = (final, *history_results)
         cache_hits = sum(result.cached for result in all_results)

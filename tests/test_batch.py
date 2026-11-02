@@ -193,11 +193,11 @@ def test_resume_skips_completed_samples_and_retries_only_failure(tmp_path: Path)
         **common,
     ).run()
 
-    assert not first.ready_for_submission
-    assert not output.exists()
+    assert first.ready_for_submission
+    assert output.exists()
     assert first.completed_samples == 2
     assert first.failed_samples == 1
-    assert factory.creations == ["public_0000", "public_0001", "public_0002"]
+    assert factory.creations == ["public_0000", "public_0001", "public_0001", "public_0002"]
 
     second = BatchRunner(
         config=BatchConfig(output=output, input_mode="text", resume=True, validate_official=False),
@@ -205,7 +205,13 @@ def test_resume_skips_completed_samples_and_retries_only_failure(tmp_path: Path)
     ).run()
 
     assert second.ready_for_submission
-    assert factory.creations == ["public_0000", "public_0001", "public_0002", "public_0001"]
+    assert factory.creations == [
+        "public_0000",
+        "public_0001",
+        "public_0001",
+        "public_0002",
+        "public_0001",
+    ]
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert [row["id"] for row in rows] == ["public_0000", "public_0001", "public_0002"]
     assert (output.parent / "failures.jsonl").read_text(encoding="utf-8") == ""
@@ -270,7 +276,7 @@ def test_parallel_batch_writes_original_order_even_when_first_sample_finishes_la
     assert [row["id"] for row in rows] == ["public_0000", "public_0001", "public_0002"]
 
 
-def test_terminal_agent_failure_is_reported_without_submission_row(tmp_path: Path) -> None:
+def test_terminal_agent_failure_keeps_degraded_submission_row(tmp_path: Path) -> None:
     dataset = _batch_dataset(tmp_path, count=1)
     output = tmp_path / "failed-agent" / "submission.jsonl"
 
@@ -293,13 +299,82 @@ def test_terminal_agent_failure_is_reported_without_submission_row(tmp_path: Pat
         progress_reporter=lambda *_args: None,
     ).run()
 
-    assert not summary.ready_for_submission
-    assert not output.exists()
+    assert summary.ready_for_submission
+    assert output.exists()
+    assert json.loads(output.read_text(encoding="utf-8"))["tool_calls"] == []
     failure = json.loads(summary.failures.read_text(encoding="utf-8"))
     assert failure["termination_reason"] == "model_bad_output_limit"
+    assert failure["submission"]["state_hash"] == "sdk-hash-public_0000"
     assert failure["model_request_diagnostics"][0]["input_tokens"] == 11
     assert failure["model_request_diagnostics"][0]["raw_model_response"]["content"] == "not-json"
     assert failure["phase_timings"]["sample_wall_seconds"] >= 0
     metrics = json.loads(summary.metrics.read_text(encoding="utf-8"))
     assert metrics["invalid_model_proposals"] == 1
     assert metrics["termination_reasons"] == {"model_bad_output_limit": 1}
+    assert metrics["degraded_submission_rows"] == 1
+    assert metrics["submission_coverage_rows"] == 1
+
+
+def test_pre_runtime_failure_gets_authoritative_empty_submission_row(tmp_path: Path) -> None:
+    dataset = _batch_dataset(tmp_path, count=1)
+    output = tmp_path / "failed-before-runtime" / "submission.jsonl"
+    factory = PerSampleFactory()
+
+    def broken_decisions(_sample):
+        raise RuntimeError("decision source initialization failed")
+
+    summary = BatchRunner(
+        dataset,
+        broken_decisions,
+        BatchConfig(output=output, input_mode="text", validate_official=False),
+        runtime=Runtime(dataset, session_factory=factory),
+        transcript_provider=lambda sample: sample.id,
+        progress_reporter=lambda *_args: None,
+    ).run()
+
+    assert summary.ready_for_submission
+    assert factory.creations == ["public_0000"]
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row == {
+        "id": "public_0000",
+        "tool_calls": [],
+        "state_hash": "sdk-hash-public_0000",
+    }
+    failure = json.loads(summary.failures.read_text(encoding="utf-8"))
+    assert failure["error_type"] == "RuntimeError"
+    assert failure["submission"] == row
+
+
+def test_post_runtime_failure_reuses_session_and_preserves_tool_calls(tmp_path: Path) -> None:
+    dataset = _batch_dataset(tmp_path, count=1)
+    output = tmp_path / "failed-after-tool" / "submission.jsonl"
+    factory = PerSampleFactory()
+
+    class ToolThenCrash:
+        name = "tool-then-crash"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_action(self, _context):
+            self.calls += 1
+            if self.calls == 1:
+                return ToolAction("alarm.list", {})
+            raise RuntimeError("unexpected controller failure")
+
+    summary = BatchRunner(
+        dataset,
+        lambda _sample: ToolThenCrash(),
+        BatchConfig(output=output, input_mode="text", validate_official=False),
+        runtime=Runtime(dataset, session_factory=factory),
+        transcript_provider=lambda sample: sample.id,
+        progress_reporter=lambda *_args: None,
+    ).run()
+
+    assert summary.ready_for_submission
+    assert factory.creations == ["public_0000"]
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row["tool_calls"] == [{"name": "alarm.list", "arguments": {}}]
+    failure = json.loads(summary.failures.read_text(encoding="utf-8"))
+    assert failure["submission"] == row
+    assert failure["tool_calls_sent"] == 1

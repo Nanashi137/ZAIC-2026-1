@@ -260,6 +260,18 @@ write bundled with completion is never silently dropped or reordered. A repeated
 also rejected before dispatch and receives one corrective turn with an instruction to finish. These internal actions
 never enter `env.get_tool_calls()`.
 
+Native chat requests default to `tool_choice=required`, with an `auto` CLI escape hatch for provider compatibility.
+Malformed-output limits are cumulative for the sample, so a valid read no longer resets an alternating malformed/read
+loop. Identical reads with unchanged state are rejected locally; any dispatched write invalidates the read cache. When
+the SDK-call budget is reached, the next application-tool proposal is rejected locally and one corrective turn remains
+for `agent.finish`. Recommended production limits keep total steps above SDK calls for this reason.
+
+Batch output distinguishes semantic completion from structural coverage. A failed run that already owns an SDK
+session contributes that session's complete `tool_calls` list and `state_hash` as a degraded row and remains present
+in `failures.jsonl`. For ASR, decision-source initialization, or other failures before runtime creates a session, the
+batch runner creates exactly one empty SDK session and uses its authoritative empty trace/hash. It never invents a
+hash. Coverage remains incomplete only if the official SDK cannot create or snapshot that fallback session.
+
 ```powershell
 # Development: separate validator remains enabled.
 .\.venv\Scripts\python.exe -m scripts.phase04_smoke `

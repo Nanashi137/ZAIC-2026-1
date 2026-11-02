@@ -587,3 +587,26 @@ def test_duplicate_recovery_allows_only_one_corrective_model_turn(tmp_path) -> N
     assert result.termination_reason == "duplicate_recovery_exhausted"
     assert len(client.requests) == 3
     assert len(session.calls) == 1
+
+
+def test_invalid_proposal_budget_is_cumulative_across_valid_tool_calls(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    source, client = _source(
+        ModelResponse(content="first malformed response"),
+        _tool_response("read", "alarm__list", {}),
+        ModelResponse(content="second malformed response"),
+        _finish_response(reason="must not be reached"),
+        max_invalid_proposals=1,
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "list alarms", source)
+
+    assert result.termination_reason == "model_bad_output_limit"
+    assert [step.status for step in result.steps] == [
+        "model_bad_output",
+        "read_succeeded",
+        "model_bad_output_limit",
+    ]
+    assert len(client.requests) == 3

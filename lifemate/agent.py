@@ -268,7 +268,6 @@ class LlmDecisionSource:
             if not isinstance(arguments, dict):
                 self._record_invalid("tool_arguments_not_object", response)
                 self._bad_output("tool arguments must decode to an object")
-            self._invalid_proposals = 0
             self._messages.append(
                 {
                     "role": "assistant",

@@ -6,6 +6,7 @@ from lifemate.runtime import (
     DecisionContext,
     ExplicitActionSource,
     Runtime,
+    RuntimeConfig,
     ToolAction,
 )
 from tests.support import FakeFactory, FakeSession, make_dataset
@@ -247,3 +248,72 @@ def test_explicitly_requested_identical_repeat_is_allowed_twice(tmp_path) -> Non
 
     assert [step.status for step in result.steps] == ["write_succeeded", "write_succeeded"]
     assert len(session.calls) == 2
+
+
+def test_identical_read_is_rejected_locally_then_finish_remains_available(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    runtime, _ = _runtime(tmp_path, session)
+    read = ToolAction("alarm.list", {})
+
+    result = runtime.run(
+        "public_test_1",
+        "list alarms",
+        ExplicitActionSource(
+            [
+                read,
+                read,
+                ToolAction("agent.finish", {"status": "done", "reason": "used first result"}),
+            ]
+        ),
+    )
+
+    assert result.termination_reason == "model_completed"
+    assert [step.status for step in result.steps] == [
+        "read_succeeded",
+        "duplicate_read_rejected",
+        "agent_finished",
+    ]
+    assert session.calls == [{"name": "alarm.list", "arguments": {}}]
+
+
+def test_repeated_read_after_correction_terminates_loop(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    runtime, _ = _runtime(tmp_path, session)
+    read = ToolAction("alarm.list", {})
+
+    result = runtime.run(
+        "public_test_1", "list alarms", ExplicitActionSource([read, read, read])
+    )
+
+    assert result.termination_reason == "read_loop_exhausted"
+    assert len(session.calls) == 1
+
+
+def test_tool_call_budget_rejection_allows_finish_without_another_sdk_call(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    dataset = make_dataset(tmp_path)
+    runtime = Runtime(
+        dataset,
+        session_factory=FakeFactory(session),
+        config=RuntimeConfig(max_steps=3, max_tool_calls=1),
+    )
+
+    result = runtime.run(
+        "public_test_1",
+        "list alarms",
+        ExplicitActionSource(
+            [
+                ToolAction("alarm.list", {}),
+                ToolAction("alarm.list", {}),
+                ToolAction("agent.finish", {"status": "done", "reason": "budget reached"}),
+            ]
+        ),
+    )
+
+    assert result.termination_reason == "model_completed"
+    assert [step.status for step in result.steps] == [
+        "read_succeeded",
+        "tool_call_budget_rejected",
+        "agent_finished",
+    ]
+    assert len(session.calls) == 1

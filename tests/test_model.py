@@ -65,7 +65,7 @@ def test_openai_compatible_client_builds_sequential_tool_request() -> None:
     assert sent["url"] == "http://localhost:1234/v1/chat/completions"
     assert sent["headers"]["Authorization"] == "Bearer secret"
     assert sent["payload"]["parallel_tool_calls"] is False
-    assert sent["payload"]["tool_choice"] == "auto"
+    assert sent["payload"]["tool_choice"] == "required"
     assert sent["payload"]["temperature"] == 0.2
     assert sent["payload"]["max_tokens"] == 333
     assert response.tool_calls[0].name == "alarm__list"
@@ -75,6 +75,20 @@ def test_openai_compatible_client_builds_sequential_tool_request() -> None:
         "total_tokens": 14,
         "requests": 1,
     }
+
+
+def test_openai_compatible_client_can_restore_auto_tool_choice() -> None:
+    transport = RecordingTransport()
+    client = OpenAICompatibleClient(base_url="http://localhost:1234/v1", transport=transport)
+    client.complete(
+        ModelRequest(
+            messages=(),
+            tools=(),
+            settings=InferenceSettings(model="fixture", tool_choice="auto"),
+        )
+    )
+
+    assert transport.calls[0]["payload"]["tool_choice"] == "auto"
 
 
 def test_official_openai_uses_current_token_field_and_can_omit_temperature() -> None:

@@ -94,8 +94,8 @@ def test_mocked_llm_over_deadline_is_a_failed_sample_with_one_toolenv(tmp_path: 
     ).run()
 
     assert summary.failed_samples == 1
-    assert not summary.ready_for_submission
-    assert not output.exists()
+    assert summary.ready_for_submission
+    assert output.exists()
     assert len(factory.creations) == 1
     failure = json.loads(summary.failures.read_text(encoding="utf-8"))
     assert failure["termination_reason"] == "sample_timeout"
@@ -138,8 +138,9 @@ def test_mocked_asr_over_deadline_fails_before_toolenv_creation(tmp_path: Path) 
     ).run()
 
     assert summary.failed_samples == 1
-    assert factory.creations == []
-    assert not output.exists()
+    assert summary.ready_for_submission
+    assert len(factory.creations) == 1
+    assert json.loads(output.read_text(encoding="utf-8"))["tool_calls"] == []
     assert (output.parent / "batch-progress.jsonl").read_text(encoding="utf-8") == ""
 
 

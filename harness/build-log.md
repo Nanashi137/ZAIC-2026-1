@@ -448,3 +448,51 @@ Live deterministic Qwen regressions were then run against the healthy local llam
 All three terminated as `model_completed`; no synthetic finish appeared in any submission trace. These runs prove the
 termination, trace, and budget regressions, not semantic task accuracy. Cached ASR text remains noisy, and in
 particular `public_0006` may have finished before performing the intended conditional action.
+
+## Phase 04.7 evidence — trial-01 coverage hardening
+
+Trial 01 produced 596 semantic completions and 38 failures. Its dominant failures were 17 malformed-output limits,
+10 timeouts, 8 tool-call-budget exhaustions, 2 duplicate-recovery exhaustions, and only one max-step exhaustion. The
+saved manifest recorded 20 model steps and 20 SDK calls; several failures repeated one read tool all 20 times, while
+`public_0367` alternated malformed text and the same `recipes.search` call for 20 turns.
+
+The controller now defaults to required native tool calls, keeps a cumulative malformed-output count, rejects
+identical unchanged-state reads, leaves a corrective finish turn at the SDK-call limit, and writes SDK-derived degraded
+rows for agent-level failures. No local rejection enters the official trace.
+
+Verification:
+
+```powershell
+uv run --frozen ruff check lifemate tests
+# All checks passed!
+
+uv run --frozen python -m compileall -q lifemate tests scripts
+# Exit 0
+
+uv run --frozen pytest -q
+# 77 passed in 2.29s
+
+uv run --frozen pytest -m integration -q
+# 6 passed, 71 deselected in 0.07s
+```
+
+Live llama.cpp checks with trial-02 settings:
+
+- `public_0367`: one request, `sys.ask_missing_info`, `awaiting_user`; the previous 20-turn malformed/read loop did not
+  recur.
+- `public_0213`: 12 permitted SDK calls, then a locally rejected 13th proposal and `agent.finish`; termination changed
+  from `tool_call_budget_exhausted` to `model_completed`, with exactly 12 official calls in the trace.
+
+These are controller/coverage checks, not claims that the selected tool sequences are semantically optimal.
+
+## Phase 04.8 evidence — fail-soft submission coverage
+
+Batch exceptions now retain a structurally valid row whenever the official SDK is usable. If a session already
+exists, the runner snapshots that same session so every recorded tool call is preserved. If ASR or controller setup
+fails before runtime, it creates one empty SDK session and records its authoritative empty trace and state hash.
+Failures remain visible in `failures.jsonl` and are retried by `--resume`; `ready_for_submission` describes structural
+coverage rather than semantic success. Only an SDK creation/snapshot failure can still leave `submission` null.
+
+Verification: `uv run --frozen pytest -q` → 79 passed; `uv run --frozen ruff check .` → all checks passed;
+`git diff --check` → clean. Regression tests cover both a pre-runtime empty fallback and a post-tool crash that reuses
+the existing session without duplicating ToolEnv construction.

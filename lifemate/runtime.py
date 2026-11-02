@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -154,6 +154,7 @@ class Runtime:
         *,
         conversation_history: tuple[Mapping[str, Any], ...] | None = None,
         deadline: SampleDeadline | None = None,
+        session_observer: Callable[[ToolSession], None] | None = None,
     ) -> RunResult:
         run_started = self.clock()
         phase_timings = {
@@ -179,6 +180,8 @@ class Runtime:
         # This is the sole ToolEnv construction for this inference.
         toolenv_started = self.clock()
         session = self.session_factory.create(self.dataset.split, sample.id, self.dataset.dataset_root)
+        if session_observer is not None:
+            session_observer(session)
         self._verify_permissions(sample, session)
         phase_timings["toolenv_creation_seconds"] += self.clock() - toolenv_started
 
@@ -186,9 +189,11 @@ class Runtime:
         calls_sent = 0
         dispatched_writes: dict[str, str] = {}
         write_dispatch_counts: dict[str, int] = {}
-        duplicate_correction_pending = False
-        duplicate_recovery_used = False
-        identical_write_allowance = _identical_write_allowance(
+        dispatched_reads: dict[str, Mapping[str, Any]] = {}
+        read_dispatch_counts: dict[str, int] = {}
+        correction_pending: str | None = None
+        corrections_used: set[str] = set()
+        identical_action_allowance = _identical_write_allowance(
             transcript, self.config.max_tool_calls
         )
         termination = "max_steps_exhausted"
@@ -207,14 +212,14 @@ class Runtime:
                 steps=tuple(steps),
                 conversation_history=conversation_history,
             )
-            corrective_turn = duplicate_correction_pending
-            duplicate_correction_pending = False
+            corrective_reason = correction_pending
+            correction_pending = None
             decision_started = self.clock()
             try:
                 action = decisions.next_action(context)
             except BadDecisionOutput as exc:
                 steps.append(StepResult(index, None, "model_bad_output", None, None, str(exc)))
-                if corrective_turn:
+                if corrective_reason == "duplicate_write":
                     termination = "duplicate_recovery_exhausted"
                     break
                 continue
@@ -267,7 +272,7 @@ class Runtime:
                             str(validation["error"]),
                         )
                     )
-                    if corrective_turn:
+                    if corrective_reason == "duplicate_write":
                         termination = "duplicate_recovery_exhausted"
                         break
                     continue
@@ -292,7 +297,7 @@ class Runtime:
                 break
             if action.name not in allowed_tools:
                 steps.append(StepResult(index, action, "permission_rejected", None, None))
-                if corrective_turn:
+                if corrective_reason == "duplicate_write":
                     termination = "duplicate_recovery_exhausted"
                     break
                 continue
@@ -305,21 +310,46 @@ class Runtime:
                 steps.append(
                     StepResult(index, action, "schema_rejected", MappingProxyType(dict(validation)), None)
                 )
-                if corrective_turn:
+                if corrective_reason == "duplicate_write":
                     termination = "duplicate_recovery_exhausted"
                     break
                 continue
             if calls_sent >= self.config.max_tool_calls:
-                termination = "tool_call_budget_exhausted"
-                break
+                observation = MappingProxyType(
+                    {
+                        "ok": False,
+                        "tool_call_budget_exhausted": True,
+                        "instruction": (
+                            "No more official SDK calls are allowed. Do not propose another application tool. "
+                            "Call agent.finish with the best status supported by the completed work."
+                        ),
+                    }
+                )
+                steps.append(
+                    StepResult(
+                        index,
+                        action,
+                        "tool_call_budget_rejected",
+                        MappingProxyType(dict(validation)),
+                        observation,
+                        "official SDK tool-call budget is exhausted",
+                    )
+                )
+                if "tool_budget" in corrections_used or corrective_reason == "tool_budget":
+                    termination = "tool_call_budget_exhausted"
+                    break
+                corrections_used.add("tool_budget")
+                correction_pending = "tool_budget"
+                continue
 
             tool_kind = allowed_tools[action.name].get("kind")
             write_key = _action_key(action.name, arguments) if tool_kind == "write" else None
+            read_key = _action_key(action.name, arguments) if tool_kind == "read" else None
             dispatched_count = write_dispatch_counts.get(write_key, 0) if write_key is not None else 0
             if (
                 write_key is not None
                 and write_key in dispatched_writes
-                and dispatched_count >= identical_write_allowance
+                and dispatched_count >= identical_action_allowance
             ):
                 prior_outcome = dispatched_writes[write_key]
                 observation = MappingProxyType(
@@ -344,11 +374,44 @@ class Runtime:
                         "an identical write already reached the SDK in this inference",
                     )
                 )
-                if duplicate_recovery_used or corrective_turn:
+                if "duplicate_write" in corrections_used or corrective_reason == "duplicate_write":
                     termination = "duplicate_recovery_exhausted"
                     break
-                duplicate_recovery_used = True
-                duplicate_correction_pending = True
+                corrections_used.add("duplicate_write")
+                correction_pending = "duplicate_write"
+                continue
+            read_count = read_dispatch_counts.get(read_key, 0) if read_key is not None else 0
+            if (
+                read_key is not None
+                and read_key in dispatched_reads
+                and read_count >= identical_action_allowance
+            ):
+                observation = MappingProxyType(
+                    {
+                        "ok": False,
+                        "already_read": True,
+                        "previous_result_available": True,
+                        "instruction": (
+                            "This identical read already succeeded and no write has changed the state. "
+                            "Use the previous result, change the query, or call agent.finish."
+                        ),
+                    }
+                )
+                steps.append(
+                    StepResult(
+                        index,
+                        action,
+                        "duplicate_read_rejected",
+                        MappingProxyType(dict(validation)),
+                        observation,
+                        "an identical read already reached the SDK without an intervening write",
+                    )
+                )
+                if read_key in corrections_used or corrective_reason == f"duplicate_read:{read_key}":
+                    termination = "read_loop_exhausted"
+                    break
+                corrections_used.add(read_key)
+                correction_pending = f"duplicate_read:{read_key}"
                 continue
             try:
                 if deadline is not None:
@@ -361,6 +424,8 @@ class Runtime:
                 break
             calls_sent += 1
             if write_key is not None:
+                dispatched_reads.clear()
+                read_dispatch_counts.clear()
                 dispatched_writes[write_key] = "uncertain"
                 write_dispatch_counts[write_key] = dispatched_count + 1
             execution_started = self.clock()
@@ -384,6 +449,9 @@ class Runtime:
             status = _classify_observation(action.name, allowed_tools[action.name], observation)
             if write_key is not None:
                 dispatched_writes[write_key] = "succeeded" if status == "write_succeeded" else status
+            if read_key is not None:
+                dispatched_reads[read_key] = MappingProxyType(dict(observation))
+                read_dispatch_counts[read_key] = read_count + 1
             steps.append(
                 StepResult(
                     index,
@@ -405,21 +473,12 @@ class Runtime:
             if status in {"sdk_rejected", "tool_error"} and tool_kind == "write":
                 termination = status
                 break
-            if calls_sent >= self.config.max_tool_calls:
-                termination = "tool_call_budget_exhausted"
-                break
-            if corrective_turn:
+            if corrective_reason == "duplicate_write":
                 termination = "duplicate_recovery_exhausted"
                 break
 
         finalization_started = self.clock()
-        submission = MappingProxyType(
-            {
-                "id": sample.id,
-                "tool_calls": session.get_tool_calls(),
-                "state_hash": session.get_state_hash(),
-            }
-        )
+        submission = self.capture_submission(sample.id, session=session)
         phase_timings["finalization_seconds"] += self.clock() - finalization_started
         try:
             if deadline is not None:
@@ -440,6 +499,26 @@ class Runtime:
             submission=submission,
             model_request_diagnostics=_model_request_diagnostics(decisions),
             phase_timings=MappingProxyType(phase_timings),
+        )
+
+    def capture_submission(
+        self, sample_id: str, *, session: ToolSession | None = None
+    ) -> Mapping[str, Any]:
+        """Return an authoritative SDK snapshot, creating an empty session only if needed."""
+
+        sample = self.dataset.get_sample(sample_id)
+        active_session = session
+        if active_session is None:
+            active_session = self.session_factory.create(
+                self.dataset.split, sample.id, self.dataset.dataset_root
+            )
+        self._verify_permissions(sample, active_session)
+        return MappingProxyType(
+            {
+                "id": sample.id,
+                "tool_calls": active_session.get_tool_calls(),
+                "state_hash": active_session.get_state_hash(),
+            }
         )
 
     @staticmethod
