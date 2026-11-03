@@ -10,7 +10,7 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 | 03 | Qwen3-ASR + conversation history | Audio and audio history reach agent correctly; reproducible ASR tests | COMPLETE (2026-11-01) |
 | 04 | Batch submission + diagnostics | Dynamic sample coverage, structural validator and official SDK schema validation | COMPLETE (2026-11-01) |
 | 04.5 | Competition compliance + runtime hardening | 28 s competition deadline, deterministic controls, one-ToolEnv scored path, compliance tests | COMPLETE (2026-11-01) |
-| 04.6 | Agent/runtime hardening + labeled mode evaluation | Finish/duplicate/read-loop controls, fail-soft rows, native/constrained-JSON oracle/ASR evaluation, isolated full-state gold replay, challenge-score estimate, paired diagnostics, JSON-safe export and auditable run identity; 119 tests passed | COMPLETE (2026-11-03) |
+| 04.6 | Agent/runtime hardening + labeled mode evaluation | Finish/duplicate/read-loop controls, fail-soft rows, native/constrained-JSON oracle/ASR evaluation, isolated full-state gold replay, challenge-score estimate, paired diagnostics, JSON-safe export and auditable run identity; 120 tests passed | COMPLETE (2026-11-03) |
 | 05 | Optimize + packaging | Repeatable experiment comparisons, selected configuration, private packaging only once rules verified | TODO |
 
 **Implementation order:** 00 → 01 → 02 → 03 → 04 → 04.5 → 04.6 → 05. Keep milestone acceptance independent.
@@ -27,7 +27,8 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 	mappings reaching JSON serialization (both modes, raw capture on/off: 4 passed). Review on 2026-11-03 fixed
 	deep read-only mapping serialization, evaluation-to-model deadline propagation, constrained requests carrying
 	conflicting native tool controls, invalid empty finish acceptance, ASR provenance/defaults, and cache-biased
-	A/B latency reporting; focused suite: 81 passed, full suite: 119 passed.
+	A/B latency reporting. Evaluation now writes a sanitized root config before inference and a per-mode config before
+	each sample loop; API-key values are excluded. Full suite: 120 passed.
 	Phase 05 is not advanced by this work.
 - **Confirmed:** tool execution uses official `ToolEnv`; actual calls and state hash are SDK-provided.
 - **Confirmed:** initial environment already includes previous history tool effects.

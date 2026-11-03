@@ -195,8 +195,11 @@ uv run python -m lifemate.cli evaluate \
 	--competition-mode
 ```
 
-Per-mode artifacts: `evaluation-records.jsonl`, `evaluation-metrics.json`, `evaluation-report.md`.
-Paired artifacts: `comparison.json`, `comparison.md`. These commands are supplied for manual runs; no full
+The A/B root contains `evaluation-config.json`, written before inference with the sanitized common configuration,
+selected-ID hash and requested modes. Each mode directory contains `run-config.json`, written before its sample loop,
+plus `evaluation-records.jsonl`, `evaluation-metrics.json`, and `evaluation-report.md`. The same per-mode configuration
+is embedded as `run_identity` in metrics. API-key values are never logged. Paired artifacts are `comparison.json` and
+`comparison.md`. These commands are supplied for manual runs; no full
 training evaluation is part of implementation verification.
 
 ## What the public kit proves (and does not)

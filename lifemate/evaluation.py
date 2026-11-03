@@ -126,9 +126,24 @@ def run_semantic_evaluation(
     records_path = output_dir / "evaluation-records.jsonl"
     metrics_path = output_dir / "evaluation-metrics.json"
     report_path = output_dir / "evaluation-report.md"
+    run_config_path = output_dir / "run-config.json"
 
     catalog = dataset.load_catalog()
     tool_kind = {name: str(spec.get("kind", "unknown")) for name, spec in catalog.tools.items()}
+    identity = dict(run_identity or {})
+    identity.update(
+        {
+            "dataset_root": str(dataset.dataset_root),
+            "split": dataset.split,
+            "catalog_schema_version": catalog.schema_version,
+            "selected_sample_count": len(selected_ids),
+            "selected_ids_sha256": hashlib.sha256(
+                "\n".join(selected_ids).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    identity = _jsonable(identity)
+    _write_json(run_config_path, identity)
 
     records: list[dict[str, Any]] = []
     confusion = Counter()
@@ -261,19 +276,7 @@ def run_semantic_evaluation(
 
     _write_jsonl(records_path, records)
     aggregate = _aggregate(records, confusion, argument_error_breakdown)
-    identity = dict(run_identity or {})
-    identity.update(
-        {
-            "dataset_root": str(dataset.dataset_root),
-            "split": dataset.split,
-            "catalog_schema_version": catalog.schema_version,
-            "selected_sample_count": len(selected_ids),
-            "selected_ids_sha256": hashlib.sha256(
-                "\n".join(selected_ids).encode("utf-8")
-            ).hexdigest(),
-        }
-    )
-    aggregate["run_identity"] = _jsonable(identity)
+    aggregate["run_identity"] = identity
     _write_json(metrics_path, aggregate)
     _write_markdown_report(report_path, aggregate, records)
 

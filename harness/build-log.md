@@ -8,7 +8,7 @@
 | 2026-11-01 | 03 | `lifemate/asr.py`, `lifemate/audio_pipeline.py`, agent/runtime/CLI, ASR/history tests, smoke script, dependencies, architecture/plan/build docs | 37 tests passed; Ruff clean; real `Qwen/Qwen3-ASR-1.7B` CUDA/BF16 run transcribed final + 2 history clips; official validator: `1 lines checked, 0 schema errors`; repeat cache run: 3/3 hits | No reference transcripts or official scorer; native-HF and CPU paths configured but not real-smoked; exact competition network/private-container rules remain unknown | Stop; Phase 04 only on explicit request |
 | 2026-11-01 | 04 | `lifemate/batch.py`, provider retry/rate-limit/latency support, CLI subcommand, batch/model tests, full offline smoke, architecture/plan/build docs | 48 tests passed; Ruff/compileall clean; 634-row scripted-model run passed structural coverage and official validation (`634 lines checked, 0 schema errors`) | No paid/live LLM run or semantic score; offline rows intentionally use scripted unsupported decisions; private execution/network rules remain unknown | Stop; Phase 05 only on explicit request |
 | 2026-11-01 | 04.5 | compliance deadline/seed controls, ASR/model/runtime/batch/CLI integration, watchdog, environment-access hardening, tests and docs | 60 tests passed; Ruff/compileall clean; real-SDK competition single sample passed; development 3-row validator smoke passed; Windows watchdog hard-stop verified | `qwen-asr` synchronous CUDA cannot be cancelled in-process; final offline LLM and watchdog wiring are Phase 05 dependencies | Phase 05 local inference and packaging |
-| 2026-11-03 | 04.6 | finish/duplicate/read-loop controls and fail-soft rows; native/constrained-JSON mode plumbing; labeled oracle/ASR evaluation and supplied challenge formula; isolated SDK full-state gold replay; action-specific JSON schemas; controller/scoring diagnostics; deep JSON-safe export; deadline propagation; run provenance and cache-aware latency reporting; evaluation/contract/plan docs | 100-sample user A/B artifacts reviewed; focused agent/evaluation/model/compliance/SDK suite: 81 passed; full suite: 119 passed; Ruff clean; compileall and `git diff --check` clean. Native estimate: oracle 35.3960, ASR 12.9359; constrained JSON: oracle 22.9167, ASR 10.7333. | `challenge_score_estimate` only: official fuzzy/partial/order matcher unavailable. Saved ASR artifacts lack checkpoint provenance; native incurred 228.16 s ASR while constrained reused 333/333 cached turns, so saved wall-latency delta is not a fair mode comparison. Scores are partial train evidence only, not a public-score predictor. | Keep native mode; evaluate generic ASR/planning improvements on multiple fixed, stratified train folds before another public submission. |
+| 2026-11-03 | 04.6 | finish/duplicate/read-loop controls and fail-soft rows; native/constrained-JSON mode plumbing; labeled oracle/ASR evaluation and supplied challenge formula; isolated SDK full-state gold replay; action-specific JSON schemas; controller/scoring diagnostics; deep JSON-safe export; deadline propagation; sanitized root/per-mode run configs; run provenance and cache-aware latency reporting; evaluation/contract/plan docs | 100-sample user A/B artifacts reviewed; full suite: 120 passed; Ruff clean; compileall and `git diff --check` clean. Native estimate: oracle 35.3960, ASR 12.9359; constrained JSON: oracle 22.9167, ASR 10.7333. | `challenge_score_estimate` only: official fuzzy/partial/order matcher unavailable. Saved ASR artifacts lack checkpoint provenance; native incurred 228.16 s ASR while constrained reused 333/333 cached turns, so saved wall-latency delta is not a fair mode comparison. Scores are partial train evidence only, not a public-score predictor. | Keep native mode; evaluate generic ASR/planning improvements on multiple fixed, stratified train folds before another public submission. |
 
 ## Phase 00 evidence
 
@@ -518,6 +518,8 @@ Review on 2026-11-03 found and fixed five implementation mismatches:
 The writer now recursively converts read-only mappings, evaluation sets the same deadline on the decision source,
 tool controls are emitted only for native requests with tools, finish arguments remain strict, evaluation defaults to
 the competition-compatible 0.6B ASR, and metrics include run identity plus model-only and ASR/cache latency fields.
+The A/B root now receives `evaluation-config.json` before inference, while every mode directory receives
+`run-config.json` before its sample loop. Both are sanitized and never contain API-key values.
 
 Saved 100-sample A/B evidence (seed 42):
 
@@ -543,7 +545,7 @@ UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen pytest -q \
 # 81 passed in 2.58s
 
 UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen pytest -q
-# 119 passed in 2.41s
+# 120 passed in 2.41s
 
 UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen ruff check lifemate tests scripts
 # All checks passed!

@@ -9,6 +9,7 @@ from types import MappingProxyType
 import pytest
 
 from lifemate.agent import LlmDecisionSource
+from lifemate.cli import evaluate_main
 from lifemate.data import DatasetReader
 from lifemate.evaluation import (
     EvaluationSummary,
@@ -113,6 +114,42 @@ def test_semantic_evaluation_generates_outputs(tmp_path: Path, monkeypatch) -> N
     assert metrics["run_identity"]["catalog_schema_version"] == "test"
     assert metrics["run_identity"]["selected_sample_count"] == 1
     assert len(metrics["run_identity"]["selected_ids_sha256"]) == 64
+    run_config = json.loads((summary.records_path.parent / "run-config.json").read_text())
+    assert run_config == metrics["run_identity"]
+
+
+def test_evaluate_cli_logs_root_config_before_inference(tmp_path: Path, monkeypatch) -> None:
+    _train_dataset(tmp_path)
+    output_dir = tmp_path / "evaluation"
+
+    def fake_run(**kwargs):
+        mode_dir = kwargs["output_dir"]
+        return EvaluationSummary(
+            mode_dir / "evaluation-records.jsonl",
+            mode_dir / "evaluation-metrics.json",
+            mode_dir / "evaluation-report.md",
+            tuple(kwargs["selected_ids"]),
+            {},
+        )
+
+    monkeypatch.setattr("lifemate.cli.configure_reproducibility", lambda *_, **__: None)
+    monkeypatch.setattr("lifemate.cli.run_semantic_evaluation", fake_run)
+
+    assert evaluate_main([
+        "--dataset-root", str(tmp_path),
+        "--output-dir", str(output_dir),
+        "--base-url", "http://127.0.0.1:1990/v1",
+        "--model", "fixture-model",
+        "--limit", "1",
+    ]) == 0
+
+    config = json.loads((output_dir / "evaluation-config.json").read_text())
+    assert config["model"] == "fixture-model"
+    assert config["input_mode"] == "oracle"
+    assert config["requested_modes"] == ["native"]
+    assert config["selected_sample_count"] == 1
+    assert config["asr"] is None
+    assert "api_key" not in config
 
 
 def test_sample_selection_rejects_negative_limit(tmp_path: Path) -> None:

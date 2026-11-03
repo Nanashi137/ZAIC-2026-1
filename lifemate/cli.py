@@ -653,6 +653,64 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
     if _is_official_openai_url(args.base_url) and not api_key:
         parser.error(f"environment variable {args.api_key_env!r} is not set")
 
+    asr_identity = (
+        {
+            "checkpoint": args.asr_checkpoint,
+            "revision": args.asr_revision,
+            "backend": args.asr_backend,
+            "device": args.asr_device,
+            "dtype": args.asr_dtype,
+            "language": args.asr_language,
+            "max_output_tokens": args.asr_max_output_tokens,
+            "max_batch_size": args.asr_max_batch_size,
+            "cache_enabled": not args.no_asr_cache,
+            "cache_dir": str(args.asr_cache_dir.expanduser().resolve()),
+        }
+        if args.input_mode == "asr"
+        else None
+    )
+    common_run_identity = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "input_mode": args.input_mode,
+        "seed": args.seed,
+        "deterministic": not args.no_deterministic,
+        "competition_mode": args.competition_mode,
+        "temperature": args.temperature,
+        "max_model_tokens": args.max_model_tokens,
+        "token_limit_field": args.token_limit_field,
+        "tool_choice": args.tool_choice,
+        "max_steps": args.max_steps,
+        "max_tool_calls": args.max_tool_calls,
+        "max_invalid_proposals": args.max_invalid_proposals,
+        "sample_timeout_seconds": args.sample_timeout_seconds,
+        "model_timeout_seconds": args.timeout,
+        "max_retries": args.max_retries,
+        "retry_base_seconds": args.retry_base_seconds,
+        "retry_max_seconds": args.retry_max_seconds,
+        "requests_per_minute": args.requests_per_minute,
+        "capture_raw_model_responses": args.capture_raw_model_responses,
+        "asr": asr_identity,
+    }
+    requested_modes = [args.agent_output_mode]
+    if args.compare_with_mode:
+        requested_modes.append(args.compare_with_mode)
+    evaluation_config = {
+        "config_schema_version": 1,
+        "dataset_root": str(dataset.dataset_root),
+        "split": dataset.split,
+        "output_dir": str(args.output_dir.expanduser().resolve()),
+        "selected_sample_count": len(selected),
+        "selected_ids_sha256": hashlib.sha256("\n".join(selected).encode("utf-8")).hexdigest(),
+        "requested_modes": requested_modes,
+        **common_run_identity,
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "evaluation-config.json").write_text(
+        json.dumps(evaluation_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
     client = OpenAICompatibleClient(
         base_url=args.base_url,
         api_key=api_key,
@@ -697,32 +755,8 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
             transcriber=transcriber,
             reference_hash_cache=reference_hash_cache,
             run_identity={
-                "model": args.model,
-                "base_url": args.base_url,
+                **common_run_identity,
                 "agent_output_mode": mode,
-                "input_mode": args.input_mode,
-                "seed": args.seed,
-                "deterministic": not args.no_deterministic,
-                "temperature": args.temperature,
-                "max_model_tokens": args.max_model_tokens,
-                "tool_choice": args.tool_choice,
-                "max_steps": args.max_steps,
-                "max_tool_calls": args.max_tool_calls,
-                "max_invalid_proposals": args.max_invalid_proposals,
-                "sample_timeout_seconds": args.sample_timeout_seconds,
-                "asr": {
-                    "checkpoint": args.asr_checkpoint,
-                    "revision": args.asr_revision,
-                    "backend": args.asr_backend,
-                    "device": args.asr_device,
-                    "dtype": args.asr_dtype,
-                    "language": args.asr_language,
-                    "max_output_tokens": args.asr_max_output_tokens,
-                    "max_batch_size": args.asr_max_batch_size,
-                    "cache_enabled": not args.no_asr_cache,
-                }
-                if args.input_mode == "asr"
-                else None,
             },
         )
 
