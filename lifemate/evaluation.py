@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from tqdm.auto import tqdm
+
 from .audio_pipeline import AudioInferencePipeline
 from .compliance import SampleDeadline, SampleDeadlineExceeded
 from .data import DatasetError, DatasetReader, Sample
@@ -149,7 +151,18 @@ def run_semantic_evaluation(
     confusion = Counter()
     argument_error_breakdown = Counter()
 
-    for index, sample_id in enumerate(selected_ids):
+    progress_description = "evaluate"
+    model = identity.get("model")
+    output_mode = identity.get("agent_output_mode")
+    if model and output_mode:
+        progress_description = f"{model} {output_mode}/{input_mode}"
+    selected_with_progress = tqdm(
+        selected_ids,
+        desc=progress_description,
+        unit="sample",
+        dynamic_ncols=True,
+    )
+    for index, sample_id in enumerate(selected_with_progress):
         sample = dataset.get_sample(sample_id)
         label = references[sample_id]
         deadline = SampleDeadline.start(sample_timeout_seconds) if sample_timeout_seconds is not None else None

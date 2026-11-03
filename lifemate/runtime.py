@@ -27,6 +27,7 @@ _WORD_REPEATS = {
 }
 _REPEAT_ONCE_MORE = re.compile(r"\b(?:repeat(?:\s+it)?|l[aặ]p\s+l[aạ]i)\b", re.IGNORECASE)
 AGENT_FINISH = "agent.finish"
+AGENT_PLAN = "agent.plan"
 
 
 class ContractMismatch(RuntimeError):
@@ -288,6 +289,35 @@ class Runtime:
                 )
                 termination = "unsupported_request" if finish_status == "unsupported" else "model_completed"
                 break
+            if action.name == AGENT_PLAN:
+                validation = _validate_plan(action.arguments, transcript, allowed_tools)
+                observation = {
+                    "ok": validation["ok"],
+                    "internal": True,
+                    "instruction": (
+                        "Execute only the accepted plan, one grounded action at a time."
+                        if validation["ok"]
+                        else "Submit a corrected grounded plan before executing application tools."
+                    ),
+                }
+                if validation["ok"]:
+                    observation.update(
+                        {
+                            "subgoal_count": validation["subgoal_count"],
+                            "planned_tools": validation["planned_tools"],
+                        }
+                    )
+                steps.append(
+                    StepResult(
+                        index,
+                        action,
+                        "agent_planned" if validation["ok"] else "invalid_plan",
+                        MappingProxyType(validation),
+                        MappingProxyType(observation),
+                        None if validation["ok"] else str(validation["error"]),
+                    )
+                )
+                continue
             try:
                 if deadline is not None:
                     deadline.check("tool validation")
@@ -577,6 +607,57 @@ def _validate_finish(arguments: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(reason, str) or not reason.strip():
         return {"ok": False, "error": "agent.finish reason must be a non-empty string"}
     return {"ok": True, "error": None}
+
+
+def _validate_plan(
+    arguments: Mapping[str, Any],
+    transcript: str,
+    allowed_tools: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    if set(arguments) != {"subgoals"} or not isinstance(arguments.get("subgoals"), list):
+        return {"ok": False, "error": "agent.plan requires exactly one subgoals array"}
+    subgoals = arguments["subgoals"]
+    if not subgoals:
+        return {"ok": False, "error": "agent.plan requires at least one subgoal"}
+    transcript_folded = " ".join(transcript.casefold().split())
+    planned_tools: list[str] = []
+    for index, subgoal in enumerate(subgoals):
+        if not isinstance(subgoal, Mapping) or set(subgoal) != {
+            "evidence", "objective", "candidate_tools", "required_information",
+        }:
+            return {"ok": False, "error": f"agent.plan subgoal {index} has invalid fields"}
+        evidence = subgoal.get("evidence")
+        objective = subgoal.get("objective")
+        candidates = subgoal.get("candidate_tools")
+        required_information = subgoal.get("required_information")
+        if not isinstance(evidence, str) or not evidence.strip():
+            return {"ok": False, "error": f"agent.plan subgoal {index} requires evidence"}
+        evidence_folded = " ".join(evidence.casefold().split())
+        if evidence_folded not in transcript_folded:
+            return {"ok": False, "error": f"agent.plan subgoal {index} evidence is not in the transcript"}
+        if not isinstance(objective, str) or not objective.strip():
+            return {"ok": False, "error": f"agent.plan subgoal {index} requires an objective"}
+        if not isinstance(candidates, list) or not candidates or not all(isinstance(item, str) for item in candidates):
+            return {"ok": False, "error": f"agent.plan subgoal {index} requires candidate tools"}
+        unavailable = [
+            item for item in candidates
+            if item not in allowed_tools and item not in {AGENT_FINISH}
+        ]
+        if unavailable:
+            return {"ok": False, "error": f"agent.plan subgoal {index} uses unavailable tools: {unavailable}"}
+        if not isinstance(required_information, list) or not all(
+            isinstance(item, str) and item.strip() for item in required_information
+        ):
+            return {"ok": False, "error": f"agent.plan subgoal {index} has invalid required information"}
+        for tool_name in candidates:
+            if tool_name not in planned_tools:
+                planned_tools.append(tool_name)
+    return {
+        "ok": True,
+        "error": None,
+        "subgoal_count": len(subgoals),
+        "planned_tools": planned_tools,
+    }
 
 
 def _model_usage(decisions: DecisionSource) -> Mapping[str, int] | None:

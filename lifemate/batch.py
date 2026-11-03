@@ -17,6 +17,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
 
+from tqdm.auto import tqdm
+
 from .asr import Transcriber
 from .audio_pipeline import AudioInferencePipeline
 from .compliance import (
@@ -340,7 +342,7 @@ class BatchRunner:
         self.paths = BatchPaths.from_output(config.output)
         self.run_identity = dict(run_identity or {})
         self.official_validator = official_validator or SubprocessOfficialValidator(dataset)
-        self.progress_reporter = progress_reporter or _default_progress
+        self.progress_reporter = progress_reporter
         self.clock = clock
         self.deadline_clock = deadline_clock
         self._sample_indexes: dict[str, int] = {}
@@ -359,6 +361,26 @@ class BatchRunner:
         pending = [sample for sample in samples if sample.id not in completed]
         total = len(samples)
         processed = len(completed)
+        progress_bar = None
+        progress_reporter = self.progress_reporter
+        if progress_reporter is None:
+            description_parts = [str(self.run_identity.get("model", "batch"))]
+            asr_identity = self.run_identity.get("asr")
+            if isinstance(asr_identity, Mapping) and asr_identity.get("engine"):
+                description_parts.append(str(asr_identity["engine"]))
+            description_parts.append(self.config.input_mode)
+            progress_bar = tqdm(
+                total=total,
+                initial=processed,
+                desc=" ".join(description_parts),
+                unit="sample",
+                dynamic_ncols=True,
+            )
+
+            def progress_reporter(completed_count: int, _total: int, sample_id: str, status: str) -> None:
+                assert progress_bar is not None
+                progress_bar.set_postfix_str(f"{sample_id}: {status}", refresh=False)
+                progress_bar.update(max(0, completed_count - progress_bar.n))
 
         iterator = map(self._process_sample, pending)
         executor: ThreadPoolExecutor | None = None
@@ -376,10 +398,12 @@ class BatchRunner:
                     failures[outcome.id] = outcome
                     status = f"failed:{outcome.error_type}"
                 self._checkpoint(samples, completed, failures, dataset_count)
-                self.progress_reporter(processed, total, outcome.id, status)
+                progress_reporter(processed, total, outcome.id, status)
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
+            if progress_bar is not None:
+                progress_bar.close()
 
         ordered_records = [completed[sample.id] for sample in samples if sample.id in completed]
         rows_by_id = {
@@ -935,10 +959,6 @@ def _atomic_write(path: Path, text: str) -> None:
         if temporary is not None:
             Path(temporary).unlink(missing_ok=True)
         raise
-
-
-def _default_progress(completed: int, total: int, sample_id: str, status: str) -> None:
-    print(f"[{completed}/{total}] {sample_id}: {status}", file=sys.stderr, flush=True)
 
 
 _FAILED_TERMINATIONS = frozenset(

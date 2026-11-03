@@ -11,7 +11,7 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 | 04 | Batch submission + diagnostics | Dynamic sample coverage, structural validator and official SDK schema validation | COMPLETE (2026-11-01) |
 | 04.5 | Competition compliance + runtime hardening | 28 s competition deadline, deterministic controls, one-ToolEnv scored path, compliance tests | COMPLETE (2026-11-01) |
 | 04.6 | Agent/runtime hardening + labeled mode evaluation | Finish/duplicate/read-loop controls, fail-soft rows, native/constrained-JSON oracle/ASR evaluation, isolated full-state gold replay, challenge-score estimate, paired diagnostics, JSON-safe export and auditable run identity; 120 tests passed | COMPLETE (2026-11-03) |
-| 05 | Optimize + packaging | Repeatable experiment comparisons, selected configuration, private packaging only once rules verified | TODO |
+| 05 | Optimize + packaging | Repeatable experiment comparisons, selected configuration, private packaging only once rules verified | IN PROGRESS (2026-11-03) |
 
 **Implementation order:** 00 → 01 → 02 → 03 → 04 → 04.5 → 04.6 → 05. Keep milestone acceptance independent.
 
@@ -51,6 +51,38 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 - **Confirmed:** normal single-sample and batch CLI runs now default to a 28-second monotonic cooperative deadline, capped below the 30-second per-sample watchdog boundary. Per-request token usage and phase timings are checkpointed; raw malformed responses are opt-in.
 - **Confirmed:** Phase 04.6 defaults native model requests to `tool_choice=required`, counts malformed responses cumulatively across valid calls, rejects identical reads without an intervening write, and leaves one corrective turn after the official call budget so `agent.finish` remains available.
 - **Confirmed:** every recoverable batch failure produces a degraded, SDK-derived submission row. Failures after session creation preserve that session's complete trace/hash; failures before runtime create one empty SDK session and use its authoritative empty trace/hash. Metrics still distinguish semantic failures from structural submission coverage. Only SDK session creation/snapshot failure can leave coverage incomplete.
+- **Confirmed:** Phase 05 starts with an agent-independent ASR benchmark under `lifemate/asr/`. It uses one fixed
+  100-final-clip train subset (seed 42), common normalization, duration preflight, tqdm progress, fsync'd per-success
+  checkpoints and strict resume fingerprints. Qwen 0.6B/1.7B, PhoWhisper medium/large, Transformers and
+  faster-whisper medium/large-v3, and ChunkFormer RNN-T/CTC share the same result contract. Whisper-family models never
+  silently chunk; a selected clip over 30 seconds fails preflight. Every report requires an exact integer parameter
+  count and records whether it came from the loaded model or a tied canonical architecture config.
+- **Confirmed:** the 500-sample ChunkFormer-RNNT run exposed one runaway digit emission. Pinned `chunkformer==1.2.2`
+  permits 64 non-blank emissions per acoustic frame internally, while its documented `endless_decode()` API exposes
+  no corresponding cap. The adapter now records and enforces `rnnt_max_symbols_per_frame` with a scoped,
+  lock-protected override, includes it in cache/run identity, and provides a paired cap-1/2/4/64 runner. A one-clip
+  reproduction supports the mechanism but does not select the final cap; full benchmark and downstream agent A/B
+  evidence remain required.
+- **Confirmed:** ChunkFormer CTC is now an explicit benchmark backend rather than a checkpoint-only alias. It records
+  `backend=chunkformer-ctc`, omits the RNN-T emission cap, bypasses the scoped RNN-T decoder override, and validates
+  the loaded checkpoint's `config.model=asr_model`; RNN-T reciprocally requires `config.model=transducer`. A paired
+  fixed-subset runner compares CTC with RNN-T caps 1 and 2. Live CTC WER/latency/VRAM and downstream semantic score
+  remain pending. Single, batch and evaluation CLIs retain Qwen as default but can explicitly select either
+  ChunkFormer backend; evaluation run identity records the engine and decoder settings.
+- **Confirmed:** Phase 05 LLM comparison uses a fixed 100-sample seed-42 oracle/native protocol matching the saved
+  Qwen3.5-4B baseline. A collision-safe wrapper varies only the local base URL, model name, and run label, logs the
+  evaluator's sanitized root/per-mode configurations, displays model/mode-specific tqdm sample progress, and refuses
+  to overwrite an existing model directory under `outputs/llm-bench`.
+- **Confirmed:** public-test batch inference uses a resume-aware tqdm bar. Its initial count comes from validated
+  checkpoint records and each update follows the atomic sample checkpoint, without changing submission semantics.
+  ChunkFormer's nested one-file tqdm is suppressed through a scoped, lock-protected module override so only the
+  aggregate evaluator/batch bar is rendered.
+- **Confirmed:** Phase 05 agent experiments are explicit run configuration, not a silent baseline change. The direct
+  baseline remains the default; `grounded-v2`, compact invalid-response history, and native-only plan-ledger can be
+  selected independently. Plan-ledger validates transcript evidence and allowed candidate tools, routes subsequent
+  model calls to planned tools plus clarification/finish, and never dispatches its internal plan to the SDK. A
+  collision-safe four-arm 100-sample runner supports oracle or uncached ChunkFormer-cap-1 audio and emits a paired
+  summary. No live result or winning architecture is claimed yet.
 - **Unverified:** official call equivalence/assignment (including fuzzy `x-match`), model/API/network rules,
   and the private Docker execution contract. Scoring formula supplied by the user; exact matcher remains unavailable.
 - **Next:** Phase 05 must implement/package the fully offline local LLM and wire the per-sample outer watchdog into the organizer-facing entrypoint. Do not run paid full-scale inference without authorization.

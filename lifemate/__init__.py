@@ -1,7 +1,20 @@
 """Competition-compliant LifeMate text and Qwen3-ASR runtime."""
 
 from .agent import ContextBuilder, LlmDecisionSource, ModelToolRegistry
-from .asr import CachedTranscriber, Qwen3ASRSettings, Qwen3ASRTranscriber, TranscriptionResult
+from .asr import (
+    CachedTranscriber,
+    ChunkFormerSettings,
+    ChunkFormerTranscriber,
+    FasterWhisperSettings,
+    FasterWhisperTranscriber,
+    PhoWhisperSettings,
+    PhoWhisperTranscriber,
+    Qwen3ASRSettings,
+    Qwen3ASRTranscriber,
+    TranscriptionResult,
+    WhisperSettings,
+    WhisperTranscriber,
+)
 from .audio_pipeline import AudioInferencePipeline, AudioRunResult
 from .batch import BatchConfig, BatchRunner, BatchRunSummary
 from .compliance import (
@@ -18,6 +31,10 @@ from .tool_schema import ToolSchemaCompatibilityError, adapt_function_parameters
 __all__ = [
     "Catalog",
     "CachedTranscriber",
+    "ChunkFormerSettings",
+    "ChunkFormerTranscriber",
+    "FasterWhisperSettings",
+    "FasterWhisperTranscriber",
     "ContextBuilder",
     "DatasetReader",
     "ExplicitActionSource",
@@ -25,6 +42,8 @@ __all__ = [
     "LlmDecisionSource",
     "ModelToolRegistry",
     "OpenAICompatibleClient",
+    "PhoWhisperSettings",
+    "PhoWhisperTranscriber",
     "AudioInferencePipeline",
     "AudioRunResult",
     "BatchConfig",
@@ -43,6 +62,8 @@ __all__ = [
     "ToolAction",
     "ToolSchemaCompatibilityError",
     "TranscriptionResult",
+    "WhisperSettings",
+    "WhisperTranscriber",
     "adapt_function_parameters",
     "configure_reproducibility",
 ]

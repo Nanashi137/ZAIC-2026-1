@@ -42,6 +42,27 @@ def _finish_response(status: str = "done", reason: str = "complete") -> ModelRes
     )
 
 
+def _plan_response(
+    evidence: str,
+    *candidate_tools: str,
+    objective: str = "complete the explicit request",
+) -> ModelResponse:
+    return _tool_response(
+        "plan",
+        "agent__plan",
+        {
+            "subgoals": [
+                {
+                    "evidence": evidence,
+                    "objective": objective,
+                    "candidate_tools": list(candidate_tools),
+                    "required_information": [],
+                }
+            ]
+        },
+    )
+
+
 def _source(*responses: ModelResponse, max_invalid_proposals: int = 2):
     client = ScriptedModelClient(list(responses))
     source = LlmDecisionSource(
@@ -86,6 +107,92 @@ def test_dynamic_tools_keep_only_allowed_and_translate_sdk_extensions() -> None:
     assert "contact_id OR phone_number" in function["parameters"]["description"]
     assert "never guess" in function["parameters"]["properties"]["contact_id"]["description"]
     assert "preserve" in function["parameters"]["properties"]["content"]["description"]
+
+
+def test_plan_ledger_is_internal_routes_tools_and_executes_sequentially(tmp_path) -> None:
+    transcript = "create an alarm at seven"
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    client = ScriptedModelClient([
+        _plan_response(transcript, "alarm.create"),
+        _tool_response("write", "alarm__create", {"time": "07:00"}),
+        _finish_response(),
+    ])
+    source = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture-model"),
+        agent_architecture="plan-ledger",
+        prompt_version="grounded-v2",
+        invalid_response_history="compact",
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path),
+        session_factory=FakeFactory(session),
+        config=RuntimeConfig(max_steps=4, max_tool_calls=2),
+    ).run("public_test_1", transcript, source)
+
+    assert [step.status for step in result.steps] == [
+        "agent_planned", "write_succeeded", "agent_finished",
+    ]
+    assert session.calls == [{"name": "alarm.create", "arguments": {"time": "07:00"}}]
+    assert [tool["function"]["name"] for tool in client.requests[0].tools] == ["agent__plan"]
+    routed_names = {tool["function"]["name"] for tool in client.requests[1].tools}
+    assert routed_names == {"alarm__create", "sys__ask_missing_info", "agent__finish"}
+    plan_feedback = [message for message in client.requests[1].messages if message["role"] == "tool"][-1]
+    assert '"status":"agent_planned"' in plan_feedback["content"]
+    assert result.submission["tool_calls"] == session.calls
+
+
+def test_plan_ledger_rejects_ungrounded_evidence_before_runtime(tmp_path) -> None:
+    transcript = "list alarms"
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    client = ScriptedModelClient([
+        _plan_response("invented request", "alarm.list"),
+        _plan_response(transcript, "alarm.list"),
+        _tool_response("read", "alarm__list", {}),
+        _finish_response(),
+    ])
+    source = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture-model"),
+        agent_architecture="plan-ledger",
+        invalid_response_history="compact",
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session),
+    ).run("public_test_1", transcript, source)
+
+    assert [step.status for step in result.steps] == [
+        "model_bad_output", "agent_planned", "read_succeeded", "agent_finished",
+    ]
+    assert [tool["function"]["name"] for tool in client.requests[1].tools] == ["agent__plan"]
+
+
+def test_grounded_prompt_and_compact_invalid_history_avoid_reinforcing_prose(tmp_path) -> None:
+    repeated = "I will keep reasoning without a tool. " * 100
+    client = ScriptedModelClient([ModelResponse(content=repeated), _finish_response()])
+    source = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture-model"),
+        prompt_version="grounded-v2",
+        invalid_response_history="compact",
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path),
+        session_factory=FakeFactory(FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})),
+    ).run("public_test_1", "list alarms", source)
+
+    assert result.termination_reason == "model_completed"
+    assert "no more and no less" in client.requests[0].messages[0]["content"]
+    second_messages = client.requests[1].messages
+    assert repeated not in json.dumps(second_messages)
+    assert any("Invalid free-text response omitted" in message.get("content", "") for message in second_messages)
+    assert any(
+        "must be exactly one available function call" in message.get("content", "")
+        for message in second_messages
+    )
 
 
 def test_schema_adapter_projects_root_one_of_and_any_of_without_wrapping_arguments() -> None:

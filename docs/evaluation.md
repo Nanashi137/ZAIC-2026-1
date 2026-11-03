@@ -202,6 +202,72 @@ is embedded as `run_identity` in metrics. API-key values are never logged. Paire
 `comparison.md`. These commands are supplied for manual runs; no full
 training evaluation is part of implementation verification.
 
+### Fixed 100-sample LLM oracle benchmark
+
+Use the collision-safe wrapper for native-tool, oracle-text LLM comparisons. It fixes the selected subset and agent
+settings to the existing Qwen3.5-4B baseline: 100 samples, seed 42, native output, temperature 0, required tool use,
+1024 output tokens, 12 tool calls, 16 steps, and the 28-second competition budget. Only the local URL, served model
+name, and filesystem-safe run label vary:
+
+```bash
+bash scripts/run_llm_oracle_benchmark.sh \
+	http://127.0.0.1:1990/v1 \
+	qwen3.5-4b \
+	qwen3.5-4b
+```
+
+The optional fourth argument changes the output root; its default is `outputs/llm-bench`, which is the existing
+workspace directory containing `qwen3.5-4b/native-oracle`. The wrapper refuses to overwrite an existing run. For a
+new server/model, change the URL, model name, and run label together. Each run writes `evaluation-config.json` plus
+`native-oracle/run-config.json`, records, metrics, and report beneath `outputs/llm-bench/<run-label>/`.
+The evaluator displays a tqdm sample progress bar labeled with the model, output mode, and input mode; this does not
+change sample selection, scoring, checkpoints, or saved artifacts.
+Public-test batch inference also uses tqdm, initializes its count from a validated `--resume` checkpoint, and shows
+the latest sample ID and termination status after each checkpointed sample. The ChunkFormer adapter suppresses its
+upstream checkpoint-fetch and one-file decoder bars, preventing initialization noise and a new `0/1` line from being
+printed for every audio clip.
+
+### Fixed 100-sample agent architecture benchmark
+
+`scripts/run_agent_benchmark.sh` evaluates four native-tool variants on the same seed-42 IDs: the unchanged direct
+baseline; `grounded-v2` prompt only; grounded prompt plus compact invalid-response history; and the structured
+plan-ledger controller. All retain 12 official calls, 1,024 output tokens, and the 28-second deadline. Plan-ledger
+uses 17 controller steps because its first step is internal and cannot reach the SDK; the other variants use 16.
+
+The third argument selects `oracle` or `asr`. ASR mode pins ChunkFormer RNN-T cap 1 and always passes
+`--no-asr-cache`, so every variant measures transcription rather than inheriting cache-order bias. The runner refuses
+to overwrite its output root and writes `agent-benchmark-summary.json` plus a Markdown comparison after all four
+runs. No variant is promoted from this development subset alone; confirm the winner on a predeclared disjoint fold.
+
+ChunkFormer downstream evaluation is selectable without changing the Qwen default. After the standalone decoder
+benchmark identifies a candidate, use a distinct output directory and cache identity, for example CTC:
+
+```bash
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+uv run --frozen --group asr --group asr-benchmark python -m lifemate.cli evaluate \
+	--base-url http://127.0.0.1:1990/v1 \
+	--model qwen3.5-4b \
+	--output-dir outputs/eval-chunkformer-ctc-100 \
+	--agent-output-mode native \
+	--input-mode asr \
+	--asr-engine chunkformer-ctc \
+	--asr-checkpoint khanhld/chunkformer-ctc-large-vie \
+	--asr-device cuda \
+	--asr-dtype float32 \
+	--asr-cache-dir cache/transcriptions-chunkformer-ctc \
+	--limit 100 \
+	--seed 42 \
+	--sample-timeout-seconds 28 \
+	--competition-mode \
+	--max-tool-calls 12 \
+	--max-steps 16
+```
+
+For RNN-T, change the engine/checkpoint/cache/output and add
+`--asr-rnnt-max-symbols-per-frame 1` or `2`. Run modes independently when comparing end-to-end wall time; reusing a
+populated cache intentionally measures cached inference rather than ASR latency. Every evaluation config records the
+engine, checkpoint, decoder settings, device, dtype, and cache identity.
+
 ## What the public kit proves (and does not)
 - `env.validate` / official `--validate`: validates tool-call schemas and availability; **does not score intent correctness**.
 - `env.get_state_hash`: attests to local simulator state resulting from actions; **does not prove target state was reached**.

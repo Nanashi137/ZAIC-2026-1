@@ -174,6 +174,56 @@ def test_batch_preserves_order_isolates_sessions_and_resets_model_conversation(t
     assert metrics["official_accuracy_score"] is None
 
 
+def test_default_batch_progress_uses_resume_aware_tqdm(tmp_path: Path, monkeypatch) -> None:
+    dataset = _batch_dataset(tmp_path, count=1)
+    calls = []
+
+    class FakeProgress:
+        def __init__(self, **kwargs):
+            self.n = kwargs["initial"]
+            self.kwargs = kwargs
+            self.postfixes = []
+            self.closed = False
+
+        def set_postfix_str(self, value, *, refresh):
+            self.postfixes.append((value, refresh))
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            self.closed = True
+
+    def fake_tqdm(**kwargs):
+        progress = FakeProgress(**kwargs)
+        calls.append(progress)
+        return progress
+
+    monkeypatch.setattr("lifemate.batch.tqdm", fake_tqdm)
+    summary = BatchRunner(
+        dataset,
+        lambda _sample: ExplicitActionSource([]),
+        BatchConfig(output=tmp_path / "progress" / "submission.jsonl", input_mode="text", validate_official=False),
+        runtime=Runtime(dataset, session_factory=PerSampleFactory()),
+        transcript_provider=lambda sample: sample.id,
+        run_identity={"model": "fixture-model"},
+    ).run()
+
+    assert summary.ready_for_submission
+    assert len(calls) == 1
+    progress = calls[0]
+    assert progress.kwargs == {
+        "total": 1,
+        "initial": 0,
+        "desc": "fixture-model text",
+        "unit": "sample",
+        "dynamic_ncols": True,
+    }
+    assert progress.n == 1
+    assert progress.postfixes == [("public_0000: decision_source_done", False)]
+    assert progress.closed
+
+
 def test_resume_skips_completed_samples_and_retries_only_failure(tmp_path: Path) -> None:
     dataset = _batch_dataset(tmp_path)
     factory = PerSampleFactory(fail_once="public_0001")

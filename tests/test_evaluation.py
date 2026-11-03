@@ -83,6 +83,13 @@ def _train_dataset(tmp_path: Path) -> DatasetReader:
 
 def test_semantic_evaluation_generates_outputs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("lifemate.evaluation.replay_gold_state_hash", lambda *_, **__: "hash")
+    progress_calls = []
+
+    def fake_tqdm(iterable, **kwargs):
+        progress_calls.append((iterable, kwargs))
+        return iterable
+
+    monkeypatch.setattr("lifemate.evaluation.tqdm", fake_tqdm)
     dataset = _train_dataset(tmp_path)
     references = load_label_references(dataset)
     selected = select_sample_ids(references, sample_ids=None, limit=1, seed=42)
@@ -99,6 +106,7 @@ def test_semantic_evaluation_generates_outputs(tmp_path: Path, monkeypatch) -> N
         input_mode="oracle",
         sample_timeout_seconds=10.0,
         compute_reference_state_hash=False,
+        run_identity={"model": "fixture-model", "agent_output_mode": "native"},
     )
 
     assert summary.records_path.is_file()
@@ -116,6 +124,14 @@ def test_semantic_evaluation_generates_outputs(tmp_path: Path, monkeypatch) -> N
     assert len(metrics["run_identity"]["selected_ids_sha256"]) == 64
     run_config = json.loads((summary.records_path.parent / "run-config.json").read_text())
     assert run_config == metrics["run_identity"]
+    assert progress_calls == [(
+        selected,
+        {
+            "desc": "fixture-model native/oracle",
+            "unit": "sample",
+            "dynamic_ncols": True,
+        },
+    )]
 
 
 def test_evaluate_cli_logs_root_config_before_inference(tmp_path: Path, monkeypatch) -> None:

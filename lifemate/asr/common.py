@@ -1,8 +1,4 @@
-"""Qwen3-ASR transcription boundary with optional, content-addressed caching.
-
-Heavy ASR dependencies are imported lazily so text-only Phase 02 remains usable.
-Audio paths are passed directly to Qwen without resampling or waveform rewriting.
-"""
+"""Shared ASR contracts, lazy initialization, path safety, and caching."""
 
 from __future__ import annotations
 
@@ -10,21 +6,27 @@ import hashlib
 import json
 import os
 import time
+import wave
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
-from .compliance import SampleDeadline, SampleDeadlineExceeded, configure_greedy_generation
+from ..compliance import SampleDeadline, SampleDeadlineExceeded
 
-ASRBackendName = Literal["qwen-asr-transformers", "native-hf"]
-ASRDevice = Literal["auto", "cpu", "cuda"] | str
-ASRDtype = Literal["auto", "float32", "float16", "bfloat16"]
+ASRDevice = str
+ASRDtype = str
+
+_EXACT_WHISPER_PARAMETER_COUNTS = {
+    # Reproducibly derived from the official Transformers configs after tie_weights().
+    "openai/whisper-medium": 763_857_920,
+    "openai/whisper-large-v3": 1_543_490_560,
+}
 
 
 class ASRError(RuntimeError):
-    """Base class for explicit Phase 03 transcription failures."""
+    """Base class for explicit transcription failures."""
 
 
 class AudioPathError(ASRError):
@@ -32,56 +34,28 @@ class AudioPathError(ASRError):
 
 
 class ASRDependencyError(ASRError):
-    """The selected optional Qwen3-ASR dependency stack is unavailable."""
+    """The selected optional ASR dependency stack is unavailable."""
 
 
 class ASRInitializationError(ASRError):
-    """The selected Qwen3-ASR model could not be initialized."""
+    """The selected ASR model could not be initialized."""
 
 
 class TranscriptionError(ASRError):
-    """Qwen3-ASR inference failed or returned a malformed result."""
+    """ASR inference failed or returned a malformed result."""
 
 
 class TranscriptionCacheError(ASRError):
     """A cache entry exists but is corrupt or inconsistent."""
 
 
-@dataclass(frozen=True)
-class Qwen3ASRSettings:
-    checkpoint: str = "Qwen/Qwen3-ASR-0.6B"
-    revision: str | None = None
-    backend: ASRBackendName = "qwen-asr-transformers"
-    device: ASRDevice = "auto"
-    dtype: ASRDtype = "auto"
-    language: str | None = "Vietnamese"
-    max_output_tokens: int = 256
-    max_inference_batch_size: int = 1
-    preprocessing_version: str = "qwen-direct-path-v1"
+class ASRSettings(Protocol):
+    checkpoint: str
+    backend: str
+    device: ASRDevice
+    dtype: ASRDtype
 
-    def __post_init__(self) -> None:
-        if not self.checkpoint.strip():
-            raise ValueError("checkpoint must be non-empty")
-        if self.max_output_tokens < 1 or self.max_inference_batch_size < 1:
-            raise ValueError("ASR token and batch limits must be positive")
-        is_hf_checkpoint = self.checkpoint.lower().endswith("-hf")
-        if self.backend == "native-hf" and not is_hf_checkpoint:
-            raise ValueError("the native-hf backend requires a Qwen3-ASR *-hf checkpoint")
-        if self.backend == "qwen-asr-transformers" and is_hf_checkpoint:
-            raise ValueError("the qwen-asr-transformers backend cannot use a *-hf checkpoint")
-
-    def cache_identity(self) -> Mapping[str, Any]:
-        """Return every setting that can change decoded transcription text."""
-
-        return {
-            "checkpoint": self.checkpoint,
-            "revision": self.revision,
-            "backend": self.backend,
-            "language": self.language,
-            "max_output_tokens": self.max_output_tokens,
-            "dtype": self.dtype,
-            "preprocessing_version": self.preprocessing_version,
-        }
+    def cache_identity(self) -> Mapping[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -96,7 +70,7 @@ class TranscriptionResult:
 
 
 class Transcriber(Protocol):
-    settings: Qwen3ASRSettings
+    settings: ASRSettings
 
     def transcribe(
         self,
@@ -106,7 +80,7 @@ class Transcriber(Protocol):
     ) -> TranscriptionResult: ...
 
 
-class _LoadedBackend(Protocol):
+class LoadedBackend(Protocol):
     def transcribe(
         self,
         audio_path: Path,
@@ -116,32 +90,42 @@ class _LoadedBackend(Protocol):
     ) -> tuple[str, str | None]: ...
 
 
-BackendFactory = Callable[[Qwen3ASRSettings], _LoadedBackend]
+BackendFactory = Callable[[Any], LoadedBackend]
 
 
-class Qwen3ASRTranscriber:
-    """Lazy, reusable Qwen3-ASR transcriber for local official audio files."""
+class BaseASRTranscriber:
+    """Lazy, reusable transcriber shared by all local ASR adapters."""
+
+    inference_name = "ASR"
 
     def __init__(
         self,
-        settings: Qwen3ASRSettings | None = None,
+        settings: ASRSettings,
         *,
         allowed_audio_root: Path | str | None = None,
-        backend_factory: BackendFactory | None = None,
+        backend_factory: BackendFactory,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
-        self.settings = settings or Qwen3ASRSettings()
+        self.settings = settings
         self.allowed_audio_root = (
             Path(allowed_audio_root).expanduser().resolve() if allowed_audio_root is not None else None
         )
-        self._backend_factory = backend_factory or _load_backend
+        self._backend_factory = backend_factory
         self._clock = clock
-        self._backend: _LoadedBackend | None = None
+        self._backend: LoadedBackend | None = None
         self.initialization_latency_seconds: float | None = None
 
-    def initialize(self, *, deadline: SampleDeadline | None = None) -> None:
-        """Load the model once. Subsequent calls reuse the same loaded object."""
+    @property
+    def parameter_count(self) -> int | None:
+        value = getattr(self._backend, "parameter_count", None)
+        return value if isinstance(value, int) and value >= 0 else None
 
+    @property
+    def parameter_count_source(self) -> str | None:
+        value = getattr(self._backend, "parameter_count_source", None)
+        return value if isinstance(value, str) and value else None
+
+    def initialize(self, *, deadline: SampleDeadline | None = None) -> None:
         if self._backend is not None:
             return
         if deadline is not None:
@@ -166,7 +150,7 @@ class Qwen3ASRTranscriber:
         if deadline is not None:
             deadline.check("audio path validation")
         resolved = resolve_audio_path(audio_path, allowed_root=self.allowed_audio_root)
-        fingerprint = _sha256_file(resolved)
+        fingerprint = sha256_file(resolved)
         if deadline is not None:
             deadline.check("audio fingerprinting")
         self.initialize(deadline=deadline)
@@ -175,7 +159,7 @@ class Qwen3ASRTranscriber:
         try:
             text, language = self._backend.transcribe(
                 resolved,
-                self.settings.language,
+                getattr(self.settings, "language", None),
                 deadline=deadline,
             )
         except SampleDeadlineExceeded:
@@ -183,12 +167,12 @@ class Qwen3ASRTranscriber:
         except TranscriptionError:
             raise
         except Exception as exc:
-            raise TranscriptionError(f"Qwen3-ASR inference failed for {resolved.name}: {exc}") from exc
+            raise TranscriptionError(f"{self.inference_name} inference failed for {resolved.name}: {exc}") from exc
         latency = self._clock() - started
         if deadline is not None:
             deadline.check("ASR inference")
         if not isinstance(text, str) or not text.strip():
-            raise TranscriptionError(f"Qwen3-ASR returned an empty transcription for {resolved.name}")
+            raise TranscriptionError(f"{self.inference_name} returned an empty transcription for {resolved.name}")
         return TranscriptionResult(
             text=text.strip(),
             language=language,
@@ -224,8 +208,8 @@ class CachedTranscriber:
             deadline.check("transcription cache lookup")
         allowed_root = getattr(self.inner, "allowed_audio_root", None)
         resolved = resolve_audio_path(audio_path, allowed_root=allowed_root)
-        audio_sha256 = _sha256_file(resolved)
-        key = _cache_key(audio_sha256, self.settings.cache_identity())
+        audio_sha256 = sha256_file(resolved)
+        key = cache_key(audio_sha256, self.settings.cache_identity())
         entry_path = self.cache_dir / key[:2] / f"{key}.json"
         if entry_path.exists():
             result = self._read_entry(entry_path, key, audio_sha256)
@@ -291,109 +275,21 @@ def resolve_audio_path(audio_path: Path | str, *, allowed_root: Path | str | Non
     return resolved
 
 
-def _load_backend(settings: Qwen3ASRSettings) -> _LoadedBackend:
-    if settings.backend == "qwen-asr-transformers":
-        return _QwenPackageBackend(settings)
-    if settings.backend == "native-hf":
-        return _NativeHuggingFaceBackend(settings)
-    raise ASRInitializationError(f"unsupported Qwen3-ASR backend: {settings.backend}")
+def audio_duration_seconds(path: Path | str) -> float:
+    """Read PCM WAV duration without decoding or changing the audio."""
+
+    resolved = Path(path)
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            frame_rate = handle.getframerate()
+            if frame_rate <= 0:
+                raise AudioPathError(f"invalid WAV frame rate: {resolved}")
+            return handle.getnframes() / frame_rate
+    except (OSError, EOFError, wave.Error) as exc:
+        raise AudioPathError(f"could not read WAV duration for {resolved}: {exc}") from exc
 
 
-class _QwenPackageBackend:
-    def __init__(self, settings: Qwen3ASRSettings) -> None:
-        try:
-            import torch
-            from qwen_asr import Qwen3ASRModel
-        except ImportError as exc:
-            raise ASRDependencyError(
-                "qwen-asr backend is not installed; install the Phase 03 ASR dependency group"
-            ) from exc
-        device, dtype = _resolve_torch_placement(torch, settings)
-        kwargs: dict[str, Any] = {
-            "dtype": dtype,
-            "device_map": device,
-            "max_inference_batch_size": settings.max_inference_batch_size,
-            "max_new_tokens": settings.max_output_tokens,
-        }
-        if settings.revision is not None:
-            kwargs["revision"] = settings.revision
-        try:
-            self.model = Qwen3ASRModel.from_pretrained(settings.checkpoint, **kwargs)
-        except Exception as exc:
-            raise ASRInitializationError(f"failed to load {settings.checkpoint}: {exc}") from exc
-        if not configure_greedy_generation(self.model.model):
-            raise ASRInitializationError("qwen-asr Transformers model has no generation_config")
-
-    def transcribe(
-        self,
-        audio_path: Path,
-        language: str | None,
-        *,
-        deadline: SampleDeadline | None = None,
-    ) -> tuple[str, str | None]:
-        if deadline is not None:
-            deadline.check("Qwen ASR inference")
-        results = self.model.transcribe(audio=str(audio_path), language=language)
-        if deadline is not None:
-            deadline.check("Qwen ASR inference")
-        if not results:
-            raise TranscriptionError("Qwen3-ASR returned no result")
-        first = results[0]
-        return first.text, getattr(first, "language", None)
-
-
-class _NativeHuggingFaceBackend:
-    def __init__(self, settings: Qwen3ASRSettings) -> None:
-        try:
-            import torch
-            from transformers import AutoModelForMultimodalLM, AutoProcessor
-        except ImportError as exc:
-            raise ASRDependencyError(
-                "native-hf backend requires a Transformers release with Qwen3-ASR support"
-            ) from exc
-        device, dtype = _resolve_torch_placement(torch, settings)
-        kwargs: dict[str, Any] = {"dtype": dtype, "device_map": device}
-        if settings.revision is not None:
-            kwargs["revision"] = settings.revision
-        try:
-            self.processor = AutoProcessor.from_pretrained(settings.checkpoint, revision=settings.revision)
-            self.model = AutoModelForMultimodalLM.from_pretrained(settings.checkpoint, **kwargs)
-        except Exception as exc:
-            raise ASRInitializationError(f"failed to load {settings.checkpoint}: {exc}") from exc
-        if not configure_greedy_generation(self.model):
-            raise ASRInitializationError("native Transformers model has no generation_config")
-        self.max_output_tokens = settings.max_output_tokens
-
-    def transcribe(
-        self,
-        audio_path: Path,
-        language: str | None,
-        *,
-        deadline: SampleDeadline | None = None,
-    ) -> tuple[str, str | None]:
-        request: dict[str, Any] = {"audio": str(audio_path)}
-        if language is not None:
-            request["language"] = language
-        inputs = self.processor.apply_transcription_request(**request)
-        inputs = inputs.to(self.model.device, self.model.dtype)
-        generation: dict[str, Any] = {
-            "max_new_tokens": self.max_output_tokens,
-            "do_sample": False,
-            "num_beams": 1,
-        }
-        if deadline is not None:
-            generation["max_time"] = deadline.remaining_seconds()
-        output_ids = self.model.generate(**inputs, **generation)
-        if deadline is not None:
-            deadline.check("native Hugging Face ASR inference")
-        prompt_length = inputs["input_ids"].shape[1]
-        parsed = self.processor.decode(output_ids[:, prompt_length:], return_format="parsed")[0]
-        if not isinstance(parsed, Mapping):
-            raise TranscriptionError("native Transformers processor returned an unexpected result")
-        return str(parsed.get("transcription", "")), _optional_string(parsed.get("language"))
-
-
-def _resolve_torch_placement(torch: Any, settings: Qwen3ASRSettings) -> tuple[str, Any]:
+def resolve_torch_placement(torch: Any, settings: ASRSettings) -> tuple[str, Any]:
     if settings.device == "auto":
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
     elif settings.device == "cuda":
@@ -410,13 +306,54 @@ def _resolve_torch_placement(torch: Any, settings: Qwen3ASRSettings) -> tuple[st
         else:
             dtype = torch.float32
     else:
-        dtype = getattr(torch, settings.dtype)
+        try:
+            dtype = getattr(torch, settings.dtype)
+        except AttributeError as exc:
+            raise ASRInitializationError(f"unsupported torch dtype: {settings.dtype}") from exc
     if device == "cpu" and dtype == torch.float16:
         raise ASRInitializationError("float16 is not supported for the CPU ASR backend; use float32 or auto")
     return device, dtype
 
 
-def _cache_key(audio_sha256: str, identity: Mapping[str, Any]) -> str:
+def model_parameter_count(model: Any) -> int | None:
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return None
+    try:
+        return sum(int(parameter.numel()) for parameter in parameters())
+    except (AttributeError, TypeError, RuntimeError):
+        return None
+
+
+def transformers_architecture_parameter_count(checkpoint: str, revision: str | None = None) -> int:
+    """Count logical parameters from a Transformers config without loading weight tensors."""
+
+    if revision is None and checkpoint.lower() in _EXACT_WHISPER_PARAMETER_COUNTS:
+        return _EXACT_WHISPER_PARAMETER_COUNTS[checkpoint.lower()]
+
+    try:
+        from accelerate import init_empty_weights
+        from transformers import AutoConfig, AutoModelForSpeechSeq2Seq
+    except ImportError as exc:
+        raise ASRDependencyError(
+            "exact faster-whisper parameter counting requires accelerate and transformers"
+        ) from exc
+    try:
+        config = AutoConfig.from_pretrained(checkpoint, revision=revision)
+        with init_empty_weights():
+            model = AutoModelForSpeechSeq2Seq.from_config(config)
+        model.tie_weights()
+        count = model_parameter_count(model)
+    except Exception as exc:
+        raise ASRInitializationError(
+            f"could not derive exact parameter count from {checkpoint}: {exc}"
+        ) from exc
+    if count is None:
+        raise ASRInitializationError(f"could not derive exact parameter count from {checkpoint}")
+    return count
+
+
+def cache_key(audio_sha256: str, identity: Mapping[str, Any]) -> str:
     canonical = json.dumps(
         {"audio_sha256": audio_sha256, "settings": identity},
         sort_keys=True,
@@ -426,7 +363,7 @@ def _cache_key(audio_sha256: str, identity: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -434,5 +371,5 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _optional_string(value: Any) -> str | None:
+def optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None

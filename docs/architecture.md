@@ -42,7 +42,7 @@ ContextBuilder ───────────────► LlmDecisionSourc
 | `lifemate/model.py` | Model request/response types, inference settings, HTTP client, deterministic fake | Standard library; tests have no network or paid API dependency |
 | `lifemate/agent.py` | Context builder, safe tool-name map, dynamic schemas, model decision source | Receives only public input, permitted tools, and actual runtime observations |
 | `lifemate/runtime.py` | Bounded proposal/validation/execution loop and official output capture | One session; invalid proposals do not execute; uncertain writes terminate |
-| `lifemate/asr.py` | Qwen3-ASR settings, lazy reusable model, path validation, structured results, optional cache | Local inference only; no alternate ASR, hosted service, aligner, or raw-state access |
+| `lifemate/asr/` | Shared lazy transcriber/cache plus Qwen3-ASR, PhoWhisper and ChunkFormer adapters; standalone benchmark | CLI defaults to Qwen but can explicitly select validated ChunkFormer RNN-T/CTC; all remain local and do not access agent/SDK state |
 | `lifemate/audio_pipeline.py` | Final/history transcription and conversation reconstruction | History calls/results are context only and never dispatched |
 | `lifemate/batch.py` | Ordered workers, checkpoints, resume, metrics/failures, final validation/export | Never invents a failed row/hash; final file requires exact coverage |
 | `lifemate/cli.py` | Explicit-action or model mode for one text-debug or audio sample | Remote model endpoints require explicit `--allow-external-data`; ASR stays local |
@@ -83,6 +83,18 @@ Model-facing schemas:
 The provider schema is guidance. Official SDK validation remains authoritative for every proposed action.
 
 ## Sequential model protocol
+
+Phase 05 keeps the sequential direct controller as the default and adds two explicitly versioned experiment axes:
+`grounded-v2` strengthens minimal, transcript-grounded action rules, while `plan-ledger` requires one internal
+`agent.plan` call before application actions. The plan schema contains transcript evidence, subgoals, candidate
+tools, and required information. Evidence must occur in the final transcript and candidate tools must be allowed.
+After acceptance, the model sees only planned tools plus `sys.ask_missing_info` and `agent.finish`. The plan is
+intercepted before SDK validation, consumes no official call budget, and never appears in submission traces. It does
+consume one controller step, so the controlled benchmark gives that variant one additional non-SDK step.
+
+The `compact` invalid-response history mode retains raw text only in opt-in diagnostics. In model context it replaces
+invalid free-text prose with a short placeholder and an explicit one-function-call correction, avoiding reinforcement
+of the observed 1,024-token repetition loops. Defaults remain `direct`, `baseline`, and `full` for reproducibility.
 
 The OpenAI-compatible client uses chat-completions function calls with `tool_choice: auto` and
 `parallel_tool_calls: false`. The latter guarantees at most one proposed call per model turn. Each accepted or rejected
@@ -165,6 +177,19 @@ official session for current-turn execution.
 The verified native setup is an isolated Python 3.12 environment with `qwen-asr==0.0.6`,
 `transformers==4.57.6`, `accelerate==1.12.0`, and `torch==2.12.1+cu130`. The locked `asr` dependency group pins the
 official PyTorch CUDA 13.0 index. The ordinary Phase 02 environment remains ASR-free because imports are lazy.
+
+Phase 05 refactors this boundary into the import-compatible `lifemate/asr/` package. Shared path validation,
+structured results, errors and content-addressed cache behavior remain unchanged for existing production imports.
+PhoWhisper, Transformers Whisper, faster-whisper/CTranslate2 and ChunkFormer RNN-T/CTC adapters support controlled
+offline comparison without changing the Qwen agent CLI default. The single, batch and evaluation CLIs can explicitly
+select `--asr-engine chunkformer-rnnt` or `chunkformer-ctc` for downstream A/B runs.
+`python -m lifemate.asr.benchmark` evaluates only labeled-train
+final clips, writes per-clip resumable checkpoints, requires an exact parameter count with provenance, and refuses
+over-window Whisper-family inputs instead of silently chunking. The pinned ChunkFormer 1.2.2 adapter also applies a
+scoped, lock-protected cap to the internal RNN-T non-blank emissions per acoustic frame; the cap participates in
+cache and benchmark identity because the upstream `endless_decode()` API does not expose it. The explicit CTC
+backend validates `config.model=asr_model`, bypasses the RNN-T override, and records no emission cap; the RNN-T
+backend requires `config.model=transducer`. See `docs/asr-benchmark.md`.
 
 ```powershell
 $env:UV_CACHE_DIR = '.uv-cache'

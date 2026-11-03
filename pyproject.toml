@@ -4,7 +4,9 @@ name = "lifemate-zac-2026"
 version = "0.1.0"
 description = "Zalo AI Challenge 2026 LifeMate agent"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "tqdm>=4.67,<5",
+]
 
 [dependency-groups]
 dev = [
@@ -15,9 +17,18 @@ asr = [
     "qwen-asr==0.0.6; python_version < '3.14'",
     "torch==2.12.1; sys_platform == 'win32' or sys_platform == 'linux'",
 ]
+asr-benchmark = [
+    "chunkformer==1.2.2; python_version >= '3.11' and python_version < '3.14'",
+    "faster-whisper==1.2.1; python_version < '3.14'",
+    "torchaudio==2.11.0; python_version < '3.14' and (sys_platform == 'win32' or sys_platform == 'linux')",
+]
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+torchaudio = [
     { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
 ]

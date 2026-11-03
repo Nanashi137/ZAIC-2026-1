@@ -14,6 +14,7 @@ from .compliance import SampleDeadline
 from .model import InferenceSettings, ModelClient, ModelClientError, ModelRequest, ModelResponse, ModelUsage
 from .runtime import (
     AGENT_FINISH,
+    AGENT_PLAN,
     BadDecisionOutput,
     DecisionContext,
     DecisionModelError,
@@ -34,6 +35,9 @@ _FINISH_PARAMETERS: Mapping[str, Any] = {
     "required": ["status", "reason"],
     "additionalProperties": False,
 }
+AGENT_ARCHITECTURES = ("direct", "plan-ledger")
+PROMPT_VERSIONS = ("baseline", "grounded-v2")
+INVALID_RESPONSE_HISTORY_MODES = ("full", "compact")
 
 
 @dataclass(frozen=True)
@@ -43,7 +47,12 @@ class ModelToolRegistry:
     official_to_model: Mapping[str, str]
 
     @classmethod
-    def from_allowed(cls, allowed: Mapping[str, Mapping[str, Any]]) -> ModelToolRegistry:
+    def from_allowed(
+        cls,
+        allowed: Mapping[str, Mapping[str, Any]],
+        *,
+        include_plan: bool = False,
+    ) -> ModelToolRegistry:
         model_to_official: dict[str, str] = {}
         official_to_model: dict[str, str] = {}
         definitions: list[Mapping[str, Any]] = []
@@ -87,6 +96,57 @@ class ModelToolRegistry:
                 },
             }
         )
+        if include_plan:
+            plan_model_name = _unique_model_name(AGENT_PLAN, model_to_official)
+            model_to_official[plan_model_name] = AGENT_PLAN
+            official_to_model[AGENT_PLAN] = plan_model_name
+            candidate_names = sorted([*allowed, AGENT_FINISH])
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": plan_model_name,
+                        "description": (
+                            "Internal planning action agent.plan. Copy exact evidence from the final transcript, "
+                            "list only explicitly requested subgoals, and name only tools needed to execute them. "
+                            "Do not invent IDs or include related/helpful actions. It is never sent to the SDK."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "subgoals": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 12,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "evidence": {"type": "string"},
+                                            "objective": {"type": "string"},
+                                            "candidate_tools": {
+                                                "type": "array",
+                                                "minItems": 1,
+                                                "items": {"type": "string", "enum": candidate_names},
+                                            },
+                                            "required_information": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": [
+                                            "evidence", "objective", "candidate_tools", "required_information",
+                                        ],
+                                        "additionalProperties": False,
+                                    },
+                                }
+                            },
+                            "required": ["subgoals"],
+                            "additionalProperties": False,
+                        },
+                        "strict": True,
+                    },
+                }
+            )
         return cls(tuple(definitions), model_to_official, official_to_model)
 
 
@@ -98,6 +158,9 @@ class ContextBuilder:
         context: DecisionContext,
         registry: ModelToolRegistry,
         output_mode: str,
+        *,
+        prompt_version: str = "baseline",
+        agent_architecture: str = "direct",
     ) -> list[dict[str, Any]]:
         sample = context.sample
         public_context = {
@@ -139,6 +202,23 @@ class ContextBuilder:
             "status unsupported. Never claim an action succeeded unless confirmed by the SDK. "
             "Do not reveal chain-of-thought; make only the next tool decision or the final status."
         )
+        if prompt_version == "grounded-v2":
+            system += (
+                " Execute exactly the actions explicitly requested in final_user_transcript: no more and no less. "
+                "Never perform a related, helpful, implied, or historical action. Use a read only when a required "
+                "argument is unavailable and that read can supply it. Omit optional arguments unless the user "
+                "explicitly stated them or an SDK observation supplied them. Never guess an ID, person, time, "
+                "amount, location, payment method, repeat rule, content, or note. Preserve user free text instead "
+                "of embellishing it. If required information is still missing, use sys.ask_missing_info. After a "
+                "successful write, treat that explicit subgoal as complete; do not add a verification read."
+            )
+        if agent_architecture == "plan-ledger":
+            system += (
+                " Before any application action, call agent.plan exactly once. Its subgoals must cover only explicit "
+                "requests in final_user_transcript, evidence must be copied verbatim from that transcript, and "
+                "candidate_tools must include every read/write needed for execution. After the plan is accepted, "
+                "execute its pending subgoals sequentially using observations for unknown IDs, then call agent.finish."
+            )
         user_payload = {
             "public_context": public_context,
             "history": history,
@@ -177,6 +257,9 @@ class LlmDecisionSource:
         max_invalid_proposals: int = 2,
         deadline: SampleDeadline | None = None,
         capture_raw_responses: bool = False,
+        agent_architecture: str = "direct",
+        prompt_version: str = "baseline",
+        invalid_response_history: str = "full",
         minimum_model_time_seconds: float = 0.25,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
@@ -184,6 +267,14 @@ class LlmDecisionSource:
             raise ValueError("max_invalid_proposals must be non-negative")
         if minimum_model_time_seconds < 0:
             raise ValueError("minimum_model_time_seconds must be non-negative")
+        if agent_architecture not in AGENT_ARCHITECTURES:
+            raise ValueError(f"unsupported agent architecture: {agent_architecture}")
+        if prompt_version not in PROMPT_VERSIONS:
+            raise ValueError(f"unsupported prompt version: {prompt_version}")
+        if invalid_response_history not in INVALID_RESPONSE_HISTORY_MODES:
+            raise ValueError(f"unsupported invalid response history mode: {invalid_response_history}")
+        if agent_architecture == "plan-ledger" and settings.agent_output_mode != "native":
+            raise ValueError("plan-ledger architecture requires native tool calling")
         self.client = client
         self.settings = settings
         self.context_builder = context_builder or ContextBuilder()
@@ -199,6 +290,12 @@ class LlmDecisionSource:
         self._latency_seconds = 0.0
         self._deadline = deadline
         self._capture_raw_responses = capture_raw_responses
+        self.agent_architecture = agent_architecture
+        self.prompt_version = prompt_version
+        self.invalid_response_history = invalid_response_history
+        self._plan_completed = agent_architecture == "direct"
+        self._planned_tools: frozenset[str] | None = None
+        self._plan_transcript: str | None = None
         self._minimum_model_time_seconds = minimum_model_time_seconds
         self._request_diagnostics: list[dict[str, Any]] = []
         self._active_diagnostic: dict[str, Any] | None = None
@@ -226,11 +323,17 @@ class LlmDecisionSource:
         if self._deadline is not None:
             self._deadline.require_duration(self._minimum_model_time_seconds, "agent model step")
         if self._messages is None:
-            self._registry = ModelToolRegistry.from_allowed(context.allowed_tools)
+            self._plan_transcript = context.transcript
+            self._registry = ModelToolRegistry.from_allowed(
+                context.allowed_tools,
+                include_plan=self.agent_architecture == "plan-ledger",
+            )
             self._messages = self.context_builder.initial_messages(
                 context,
                 self._registry,
                 self.settings.agent_output_mode,
+                prompt_version=self.prompt_version,
+                agent_architecture=self.agent_architecture,
             )
         self._append_new_step_feedback(context.steps)
         assert self._registry is not None
@@ -317,6 +420,17 @@ class LlmDecisionSource:
                 }
             )
             official_name = self._registry.model_to_official.get(call.name, call.name)
+            if official_name == AGENT_PLAN:
+                plan_error = _plan_proposal_error(arguments, self._registry, self._plan_transcript or "")
+                if plan_error is not None:
+                    self._record_invalid("invalid_plan", response)
+                    self._bad_output(plan_error)
+                self._planned_tools = frozenset(
+                    tool_name
+                    for subgoal in arguments["subgoals"]
+                    for tool_name in subgoal["candidate_tools"]
+                )
+                self._plan_completed = True
             if self._active_diagnostic is not None:
                 self._active_diagnostic["selected_tool"] = official_name
             return ToolAction(
@@ -382,6 +496,19 @@ class LlmDecisionSource:
         assert self._registry is not None
         if self.settings.agent_output_mode == "constrained-json":
             return ()
+        if not self._plan_completed:
+            plan_name = self._registry.official_to_model[AGENT_PLAN]
+            return tuple(
+                definition for definition in self._registry.definitions
+                if definition["function"]["name"] == plan_name
+            )
+        if self._planned_tools is not None:
+            always_available = {AGENT_FINISH, "sys.ask_missing_info"}
+            allowed = self._planned_tools | always_available
+            return tuple(
+                definition for definition in self._registry.definitions
+                if self._registry.model_to_official[definition["function"]["name"]] in allowed
+            )
         return self._registry.definitions
 
     def _response_format(self) -> Mapping[str, Any] | None:
@@ -433,13 +560,18 @@ class LlmDecisionSource:
                     }
                 )
             else:
-                self._messages.append(
-                    {
-                        "role": "user",
-                        "content": "Previous proposal feedback: "
-                        + json.dumps(feedback, ensure_ascii=False, separators=(",", ":")),
-                    }
-                )
+                prefix = "Previous proposal feedback: "
+                if self.invalid_response_history == "compact" and step.status in {
+                    "model_bad_output", "model_bad_output_limit",
+                }:
+                    prefix = (
+                        "Correction required: the previous response was invalid. Do not explain, reason in prose, "
+                        "or repeat it. Your next response must be exactly one available function call. Feedback: "
+                    )
+                self._messages.append({
+                    "role": "user",
+                    "content": prefix + json.dumps(feedback, ensure_ascii=False, separators=(",", ":")),
+                })
         self._reported_steps = len(steps)
 
     def _record_invalid(self, category: str, response: ModelResponse) -> None:
@@ -449,7 +581,10 @@ class LlmDecisionSource:
             if self._capture_raw_responses:
                 self._active_diagnostic["raw_model_response"] = _diagnostic_response(response)
         if response.content:
-            self._messages.append({"role": "assistant", "content": response.content})
+            content = response.content
+            if self.invalid_response_history == "compact":
+                content = "[Invalid free-text response omitted; a function call is required.]"
+            self._messages.append({"role": "assistant", "content": content})
 
     def _bad_output(self, message: str) -> None:
         self._invalid_proposals += 1
@@ -467,6 +602,45 @@ def _unique_model_name(official_name: str, used: Mapping[str, str]) -> str:
         return candidate
     digest = hashlib.sha256(official_name.encode("utf-8")).hexdigest()[:8]
     return f"{candidate[:55]}_{digest}"
+
+
+def _plan_proposal_error(
+    arguments: Mapping[str, Any],
+    registry: ModelToolRegistry,
+    transcript: str,
+) -> str | None:
+    if set(arguments) != {"subgoals"}:
+        return "agent.plan requires exactly one subgoals field"
+    subgoals = arguments.get("subgoals")
+    if not isinstance(subgoals, list) or not subgoals:
+        return "agent.plan requires at least one subgoal"
+    allowed = set(registry.official_to_model) - {AGENT_PLAN}
+    transcript_folded = " ".join(transcript.casefold().split())
+    for index, subgoal in enumerate(subgoals):
+        if not isinstance(subgoal, Mapping) or set(subgoal) != {
+            "evidence", "objective", "candidate_tools", "required_information",
+        }:
+            return f"agent.plan subgoal {index} has invalid fields"
+        evidence = subgoal.get("evidence")
+        objective = subgoal.get("objective")
+        candidates = subgoal.get("candidate_tools")
+        required_information = subgoal.get("required_information")
+        if not isinstance(evidence, str) or not evidence.strip():
+            return f"agent.plan subgoal {index} requires evidence"
+        if " ".join(evidence.casefold().split()) not in transcript_folded:
+            return f"agent.plan subgoal {index} evidence must be copied from the final transcript"
+        if not isinstance(objective, str) or not objective.strip():
+            return f"agent.plan subgoal {index} requires an objective"
+        if not isinstance(candidates, list) or not candidates:
+            return f"agent.plan subgoal {index} requires candidate_tools"
+        unavailable = [item for item in candidates if not isinstance(item, str) or item not in allowed]
+        if unavailable:
+            return f"agent.plan subgoal {index} names unavailable tools: {unavailable}"
+        if not isinstance(required_information, list) or not all(
+            isinstance(item, str) and item.strip() for item in required_information
+        ):
+            return f"agent.plan subgoal {index} has invalid required_information"
+    return None
 
 
 def _tool_description(official_name: str, spec: Mapping[str, Any]) -> str:
