@@ -97,6 +97,7 @@ class ContextBuilder:
         self,
         context: DecisionContext,
         registry: ModelToolRegistry,
+        output_mode: str,
     ) -> list[dict[str, Any]]:
         sample = context.sample
         public_context = {
@@ -108,6 +109,20 @@ class ContextBuilder:
         finish_model_name = registry.official_to_model[AGENT_FINISH]
         history_source = context.conversation_history if context.conversation_history is not None else sample.history
         history = [_history_turn(turn) for turn in history_source]
+        completion_instruction = (
+            f"When all requested actions are complete, immediately call {finish_model_name} "
+            "(the internal action agent.finish). If more actions are required, "
+            "continue with those actions. Do not produce free-text JSON to terminate the task. "
+        )
+        if output_mode == "constrained-json":
+            completion_instruction = (
+                'Return exactly one JSON object with fields "name" and "arguments", without markdown or prose. '
+                "Use the exact official name and parameter schema from available_actions. "
+                "Include required arguments and do not invent parameter names or IDs. "
+                'When complete, return {"name":"agent.finish","arguments":{"status":"done",'
+                '"reason":"complete"}}. For unsupported requests use status "unsupported" and a non-empty reason. '
+                "If more actions are required, continue with those actions. "
+            )
         system = (
             "You are a Vietnamese voice-to-action planner for the LifeMate competition. "
             "Choose only from the provided functions. "
@@ -117,9 +132,7 @@ class ContextBuilder:
             "An observation with ok=true and done=false is a no-op, not success. "
             "After a write succeeds, do not repeat that operation unless the user explicitly requested another "
             "distinct execution. A subsequent read does not invalidate an earlier successful write. "
-            f"When all requested actions are complete, immediately call {finish_model_name} "
-            "(the internal action agent.finish). If more actions are required, "
-            "continue with those actions. Do not produce free-text JSON to terminate the task. "
+            + completion_instruction +
             "If required user information is missing, call the provided sys.ask_missing_info function "
             "with exact schema "
             "parameter names. If no available official tool can satisfy the request, call agent.finish with "
@@ -134,6 +147,18 @@ class ContextBuilder:
                 "qwen3_asr" if context.conversation_history is not None else "debug_override"
             ),
         }
+        if output_mode == "constrained-json":
+            user_payload["available_actions"] = [
+                {
+                    "name": registry.model_to_official[definition["function"]["name"]],
+                    "kind": str(context.allowed_tools.get(
+                        registry.model_to_official[definition["function"]["name"]], {}
+                    ).get("kind", "internal")),
+                    "description": definition["function"]["description"],
+                    "parameters": definition["function"]["parameters"],
+                }
+                for definition in registry.definitions
+            ]
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))},
@@ -202,7 +227,11 @@ class LlmDecisionSource:
             self._deadline.require_duration(self._minimum_model_time_seconds, "agent model step")
         if self._messages is None:
             self._registry = ModelToolRegistry.from_allowed(context.allowed_tools)
-            self._messages = self.context_builder.initial_messages(context, self._registry)
+            self._messages = self.context_builder.initial_messages(
+                context,
+                self._registry,
+                self.settings.agent_output_mode,
+            )
         self._append_new_step_feedback(context.steps)
         assert self._registry is not None
         remaining_before = self._deadline.remaining_seconds() if self._deadline is not None else None
@@ -218,9 +247,10 @@ class LlmDecisionSource:
             response = self.client.complete(
                 ModelRequest(
                     messages=tuple(self._messages),
-                    tools=self._registry.definitions,
+                    tools=self._model_tools(),
                     settings=self.settings,
                     deadline=self._deadline,
+                    response_format=self._response_format(),
                 )
             )
         except ModelClientError as exc:
@@ -247,6 +277,11 @@ class LlmDecisionSource:
             self._active_diagnostic = None
 
     def _parse_response(self, response: ModelResponse) -> ToolAction | None:
+        if self.settings.agent_output_mode == "constrained-json":
+            return self._parse_constrained_json_response(response)
+        return self._parse_native_response(response)
+
+    def _parse_native_response(self, response: ModelResponse) -> ToolAction | None:
         assert self._messages is not None and self._registry is not None
         if response.refusal:
             self._record_invalid("refusal", response)
@@ -294,6 +329,90 @@ class LlmDecisionSource:
         self._record_invalid("missing_tool_call", response)
         self._bad_output("model returned no tool call; use agent.finish to terminate")
         raise AssertionError("unreachable")
+
+    def _parse_constrained_json_response(self, response: ModelResponse) -> ToolAction | None:
+        assert self._messages is not None and self._registry is not None
+        if response.refusal:
+            self._record_invalid("refusal", response)
+            raise DecisionRefusal(response.refusal)
+        if response.tool_calls:
+            self._record_invalid("unexpected_tool_calls", response)
+            self._bad_output(
+                "constrained-json mode expects a single JSON object in assistant content, not tool_calls"
+            )
+        if not isinstance(response.content, str) or not response.content.strip():
+            self._record_invalid("missing_json_content", response)
+            self._bad_output("constrained-json mode requires non-empty JSON content")
+            raise AssertionError("unreachable")
+        try:
+            parsed = json.loads(response.content)
+        except json.JSONDecodeError as exc:
+            self._record_invalid("invalid_json_content", response)
+            self._bad_output(f"assistant content is not valid JSON: {exc.msg}")
+            raise AssertionError("unreachable") from exc
+        if not isinstance(parsed, dict):
+            self._record_invalid("json_not_object", response)
+            self._bad_output("assistant JSON must be an object")
+            raise AssertionError("unreachable")
+        if set(parsed) != {"name", "arguments"}:
+            self._record_invalid("invalid_action_fields", response)
+            self._bad_output("assistant JSON requires exactly 'name' and 'arguments'")
+            raise AssertionError("unreachable")
+        name = parsed.get("name")
+        arguments = parsed.get("arguments")
+        if not isinstance(name, str):
+            self._record_invalid("missing_action_name", response)
+            self._bad_output("assistant JSON requires a string field 'name'")
+            raise AssertionError("unreachable")
+        if not isinstance(arguments, dict):
+            self._record_invalid("invalid_action_arguments", response)
+            self._bad_output("assistant JSON requires an object field 'arguments'")
+            raise AssertionError("unreachable")
+        allowed_names = set(self._registry.official_to_model)
+        if name not in allowed_names:
+            self._record_invalid("action_not_allowed", response)
+            self._bad_output(f"assistant selected unavailable action {name!r}")
+            raise AssertionError("unreachable")
+        self._messages.append({"role": "assistant", "content": response.content})
+        if self._active_diagnostic is not None:
+            self._active_diagnostic["selected_tool"] = name
+        return ToolAction(name, arguments)
+
+    def _model_tools(self) -> tuple[Mapping[str, Any], ...]:
+        assert self._registry is not None
+        if self.settings.agent_output_mode == "constrained-json":
+            return ()
+        return self._registry.definitions
+
+    def _response_format(self) -> Mapping[str, Any] | None:
+        if self.settings.agent_output_mode != "constrained-json":
+            return None
+        assert self._registry is not None
+        variants = [
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": [
+                        self._registry.model_to_official[definition["function"]["name"]]
+                    ]},
+                    "arguments": definition["function"]["parameters"],
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": False,
+            }
+            for definition in self._registry.definitions
+        ]
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "next_action",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "oneOf": variants,
+                },
+            },
+        }
 
     def _append_new_step_feedback(self, steps: Sequence[StepResult]) -> None:
         assert self._messages is not None

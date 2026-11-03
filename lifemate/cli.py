@@ -24,6 +24,13 @@ from .compliance import (
     configure_reproducibility,
 )
 from .data import DatasetReader
+from .evaluation import (
+    compare_evaluations,
+    load_label_references,
+    run_semantic_evaluation,
+    select_sample_ids,
+    write_comparison_markdown,
+)
 from .model import InferenceSettings, OpenAICompatibleClient, RetrySettings
 from .runtime import ExplicitActionSource, Runtime, RuntimeConfig, ToolAction
 
@@ -124,6 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-base-seconds", type=float, default=1.0)
     parser.add_argument("--retry-max-seconds", type=float, default=8.0)
     parser.add_argument("--max-invalid-proposals", type=int, default=2)
+    parser.add_argument(
+        "--agent-output-mode",
+        choices=("native", "constrained-json"),
+        default="native",
+    )
     parser.add_argument("--competition-mode", action="store_true")
     parser.add_argument(
         "--sample-timeout-seconds", type=float, default=DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
@@ -131,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-raw-model-responses", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-deterministic", action="store_true")
-    parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-1.7B")
+    parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument(
         "--asr-backend",
         choices=("qwen-asr-transformers", "native-hf"),
@@ -191,6 +203,11 @@ def build_batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--max-tool-calls", type=int, default=6)
     parser.add_argument("--max-invalid-proposals", type=int, default=2)
+    parser.add_argument(
+        "--agent-output-mode",
+        choices=("native", "constrained-json"),
+        default="native",
+    )
     parser.add_argument("--competition-mode", action="store_true")
     parser.add_argument(
         "--sample-timeout-seconds", type=float, default=DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
@@ -198,7 +215,7 @@ def build_batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-raw-model-responses", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-deterministic", action="store_true")
-    parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-1.7B")
+    parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument(
         "--asr-backend", choices=("qwen-asr-transformers", "native-hf"), default="qwen-asr-transformers"
     )
@@ -215,10 +232,72 @@ def build_batch_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_evaluate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run semantic evaluation on labeled train data.")
+    parser.add_argument("--dataset-root", type=Path, default=Path("data/train+public_test"))
+    parser.add_argument("--split", default="train", choices=("train",))
+    parser.add_argument("--input-mode", choices=("oracle", "asr"), default="oracle")
+    parser.add_argument("--sample-id", action="append", default=[])
+    parser.add_argument("--sample-ids-file", type=Path)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--max-model-tokens", type=int, default=1024)
+    parser.add_argument("--temperature", type=_temperature, default=0.0)
+    parser.add_argument(
+        "--token-limit-field",
+        choices=("auto", "max_tokens", "max_completion_tokens"),
+        default="auto",
+    )
+    parser.add_argument("--tool-choice", choices=("auto", "required"), default="required")
+    parser.add_argument("--requests-per-minute", type=float)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--retry-base-seconds", type=float, default=1.0)
+    parser.add_argument("--retry-max-seconds", type=float, default=8.0)
+    parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument("--max-tool-calls", type=int, default=6)
+    parser.add_argument("--max-invalid-proposals", type=int, default=2)
+    parser.add_argument(
+        "--agent-output-mode",
+        choices=("native", "constrained-json"),
+        default="native",
+    )
+    parser.add_argument(
+        "--compare-with-mode",
+        choices=("native", "constrained-json"),
+    )
+    parser.add_argument("--competition-mode", action="store_true")
+    parser.add_argument(
+        "--sample-timeout-seconds", type=float, default=DEFAULT_SOFT_SAMPLE_TIMEOUT_SECONDS
+    )
+    parser.add_argument("--capture-raw-model-responses", action="store_true")
+    parser.add_argument("--no-deterministic", action="store_true")
+    parser.add_argument("--asr-checkpoint", default="Qwen/Qwen3-ASR-0.6B")
+    parser.add_argument(
+        "--asr-backend", choices=("qwen-asr-transformers", "native-hf"), default="qwen-asr-transformers"
+    )
+    parser.add_argument("--asr-revision")
+    parser.add_argument("--asr-device", default="auto")
+    parser.add_argument("--asr-dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
+    parser.add_argument("--asr-language", choices=("Vietnamese", "auto"), default="Vietnamese")
+    parser.add_argument("--asr-max-output-tokens", type=int, default=256)
+    parser.add_argument("--asr-max-batch-size", type=int, default=1)
+    parser.add_argument("--asr-cache-dir", type=Path, default=Path("cache/transcriptions"))
+    parser.add_argument("--no-asr-cache", action="store_true")
+    parser.add_argument("--allow-external-data", action="store_true")
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(argv) if argv is not None else sys.argv[1:]
     if arguments and arguments[0] == "batch":
         return batch_main(arguments[1:])
+    if arguments and arguments[0] == "evaluate":
+        return evaluate_main(arguments[1:])
     parser = build_parser()
     args = parser.parse_args(arguments)
     if args.input_mode == "text" and not args.transcript:
@@ -270,6 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_output_tokens=args.max_output_tokens,
                 max_tokens_field=args.token_limit_field,
                 tool_choice=args.tool_choice,
+                agent_output_mode=args.agent_output_mode,
             ),
             max_invalid_proposals=args.max_invalid_proposals,
             deadline=deadline,
@@ -398,6 +478,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         max_output_tokens=args.max_model_tokens,
         max_tokens_field=args.token_limit_field,
         tool_choice=args.tool_choice,
+        agent_output_mode=args.agent_output_mode,
     )
 
     def decisions(_sample):
@@ -463,6 +544,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
         "max_model_tokens": args.max_model_tokens,
         "token_limit_field": args.token_limit_field,
         "tool_choice": args.tool_choice,
+        "agent_output_mode": args.agent_output_mode,
         "max_steps": args.max_steps,
         "max_tool_calls": args.max_tool_calls,
         "max_invalid_proposals": args.max_invalid_proposals,
@@ -520,6 +602,161 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
     return 0 if summary.ready_for_submission else 1
 
 
+def evaluate_main(argv: Sequence[str] | None = None) -> int:
+    parser = build_evaluate_parser()
+    args = parser.parse_args(argv)
+    if args.sample_timeout_seconds is not None and args.sample_timeout_seconds <= 0:
+        parser.error("--sample-timeout-seconds must be positive")
+    if args.sample_timeout_seconds is not None and args.sample_timeout_seconds > HARD_SAMPLE_TIMEOUT_SECONDS:
+        parser.error("--sample-timeout-seconds cannot exceed the 30-second hard sample budget")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    if args.compare_with_mode == args.agent_output_mode:
+        parser.error("--compare-with-mode must differ from --agent-output-mode")
+    if args.competition_mode and args.no_deterministic:
+        parser.error("--competition-mode requires deterministic execution")
+    if args.competition_mode and args.temperature != 0.0:
+        parser.error("--competition-mode requires --temperature 0")
+    if not _is_local_url(args.base_url) and not args.allow_external_data:
+        parser.error("a non-local --base-url requires explicit --allow-external-data approval")
+    if args.competition_mode and not _is_local_url(args.base_url):
+        parser.error("--competition-mode forbids non-local model endpoints")
+
+    configure_reproducibility(args.seed, deterministic=not args.no_deterministic)
+    dataset = DatasetReader(args.dataset_root, args.split, allow_train=True)
+    references = load_label_references(dataset)
+
+    selected_ids = _collect_selected_ids(args.sample_id, args.sample_ids_file)
+    selected = select_sample_ids(references, sample_ids=selected_ids, limit=args.limit, seed=args.seed)
+    runtime = Runtime(
+        dataset,
+        config=RuntimeConfig(max_steps=args.max_steps, max_tool_calls=args.max_tool_calls),
+    )
+    transcriber = None
+    if args.input_mode == "asr":
+        base_transcriber = Qwen3ASRTranscriber(
+            Qwen3ASRSettings(
+                checkpoint=args.asr_checkpoint,
+                revision=args.asr_revision,
+                backend=args.asr_backend,
+                device=args.asr_device,
+                dtype=args.asr_dtype,
+                language=None if args.asr_language == "auto" else args.asr_language,
+                max_output_tokens=args.asr_max_output_tokens,
+                max_inference_batch_size=args.asr_max_batch_size,
+            ),
+            allowed_audio_root=dataset.split_dir,
+        )
+        transcriber = base_transcriber if args.no_asr_cache else CachedTranscriber(base_transcriber, args.asr_cache_dir)
+
+    api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
+    if _is_official_openai_url(args.base_url) and not api_key:
+        parser.error(f"environment variable {args.api_key_env!r} is not set")
+
+    client = OpenAICompatibleClient(
+        base_url=args.base_url,
+        api_key=api_key,
+        timeout_seconds=args.timeout,
+        retry_settings=RetrySettings(
+            max_retries=args.max_retries,
+            base_delay_seconds=args.retry_base_seconds,
+            max_delay_seconds=args.retry_max_seconds,
+        ),
+        requests_per_minute=args.requests_per_minute,
+    )
+
+    reference_hash_cache: dict[tuple[str, str, str], tuple[str | None, str | None]] = {}
+
+    def run_mode(mode: str, output_dir: Path):
+        inference_settings = InferenceSettings(
+            model=args.model,
+            temperature=args.temperature,
+            max_output_tokens=args.max_model_tokens,
+            max_tokens_field=args.token_limit_field,
+            tool_choice=args.tool_choice,
+            agent_output_mode=mode,
+        )
+
+        def decision_factory(_sample):
+            return LlmDecisionSource(
+                client,
+                inference_settings,
+                max_invalid_proposals=args.max_invalid_proposals,
+                capture_raw_responses=args.capture_raw_model_responses,
+            )
+
+        return run_semantic_evaluation(
+            dataset=dataset,
+            references=references,
+            selected_ids=selected,
+            runtime=runtime,
+            decision_source_factory=decision_factory,
+            output_dir=output_dir,
+            input_mode=args.input_mode,
+            sample_timeout_seconds=args.sample_timeout_seconds,
+            transcriber=transcriber,
+            reference_hash_cache=reference_hash_cache,
+            run_identity={
+                "model": args.model,
+                "base_url": args.base_url,
+                "agent_output_mode": mode,
+                "input_mode": args.input_mode,
+                "seed": args.seed,
+                "deterministic": not args.no_deterministic,
+                "temperature": args.temperature,
+                "max_model_tokens": args.max_model_tokens,
+                "tool_choice": args.tool_choice,
+                "max_steps": args.max_steps,
+                "max_tool_calls": args.max_tool_calls,
+                "max_invalid_proposals": args.max_invalid_proposals,
+                "sample_timeout_seconds": args.sample_timeout_seconds,
+                "asr": {
+                    "checkpoint": args.asr_checkpoint,
+                    "revision": args.asr_revision,
+                    "backend": args.asr_backend,
+                    "device": args.asr_device,
+                    "dtype": args.asr_dtype,
+                    "language": args.asr_language,
+                    "max_output_tokens": args.asr_max_output_tokens,
+                    "max_batch_size": args.asr_max_batch_size,
+                    "cache_enabled": not args.no_asr_cache,
+                }
+                if args.input_mode == "asr"
+                else None,
+            },
+        )
+
+    primary_dir = args.output_dir / f"{args.agent_output_mode}-{args.input_mode}"
+    primary = run_mode(args.agent_output_mode, primary_dir)
+    result: dict[str, Any] = {
+        "mode": args.agent_output_mode,
+        "records": str(primary.records_path),
+        "metrics": str(primary.metrics_path),
+        "report": str(primary.report_path),
+        "sample_count": len(primary.selected_ids),
+    }
+
+    if args.compare_with_mode:
+        secondary_dir = args.output_dir / f"{args.compare_with_mode}-{args.input_mode}"
+        secondary = run_mode(args.compare_with_mode, secondary_dir)
+        native, constrained = (
+            (primary, secondary) if args.agent_output_mode == "native" else (secondary, primary)
+        )
+        comparison = compare_evaluations(native, constrained)
+        comparison_path = args.output_dir / "comparison.json"
+        comparison_markdown_path = args.output_dir / "comparison.md"
+        comparison_path.parent.mkdir(parents=True, exist_ok=True)
+        comparison_path.write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_comparison_markdown(comparison_markdown_path, comparison)
+        result["compare_with_mode"] = args.compare_with_mode
+        result["secondary_metrics"] = str(secondary.metrics_path)
+        result["comparison_json"] = str(comparison_path)
+        result["comparison_markdown"] = str(comparison_markdown_path)
+
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def _is_local_url(value: str) -> bool:
     host = (urlparse(value).hostname or "").lower()
     return host in {"localhost", "127.0.0.1", "::1"}
@@ -527,6 +764,17 @@ def _is_local_url(value: str) -> bool:
 
 def _is_official_openai_url(value: str) -> bool:
     return (urlparse(value).hostname or "").lower() == "api.openai.com"
+
+
+def _collect_selected_ids(sample_ids: Sequence[str], sample_ids_file: Path | None) -> list[str]:
+    values = [sample_id for sample_id in sample_ids if sample_id]
+    if sample_ids_file is None:
+        return values
+    for line in sample_ids_file.read_text(encoding="utf-8").splitlines():
+        item = line.strip()
+        if item:
+            values.append(item)
+    return values
 
 
 if __name__ == "__main__":

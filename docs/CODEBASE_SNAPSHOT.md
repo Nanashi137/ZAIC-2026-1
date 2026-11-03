@@ -43,7 +43,7 @@ Datasets, virtual environments, caches, checkpoints, traces, and generated outpu
 |---|---|
 | Language | Python `>=3.11`; records show main tests on 3.13 and ASR on 3.12.12 |
 | Dependency management | `uv`, `pyproject.toml`, `uv.lock` |
-| ASR | `Qwen/Qwen3-ASR-1.7B`, `qwen-asr==0.0.6`, Transformers wrapper; optional code path for `*-hf` |
+| ASR | `Qwen/Qwen3-ASR-0.6B` default, `qwen-asr==0.0.6`, Transformers wrapper; optional code path for `*-hf` |
 | GPU stack | Locked `torch==2.12.1+cu130`; `transformers==4.57.6`, `accelerate==1.12.0` |
 | LLM | No concrete model selected; configurable OpenAI-compatible Chat Completions client using `urllib` |
 | Orchestration | Hand-written single-agent sequential loop; no LangGraph, planner service, or multi-agent framework |
@@ -93,7 +93,7 @@ Termination reasons include model completion/unsupported, awaiting user, refusal
 
 ## 6. Qwen3-ASR implementation
 
-Configured defaults in `Qwen3ASRSettings`: `Qwen/Qwen3-ASR-1.7B`, `qwen-asr-transformers`, device/dtype `auto`, forced `Vietnamese`, 256 output tokens, batch size 1, and preprocessing identity `qwen-direct-path-v1`. Auto placement chooses `cuda:0` then BF16 when supported, otherwise FP16; CPU defaults to FP32. Audio is passed directly to Qwen without repository-side resampling, alignment, or timestamps.
+Configured defaults in `Qwen3ASRSettings`: `Qwen/Qwen3-ASR-0.6B`, `qwen-asr-transformers`, device/dtype `auto`, forced `Vietnamese`, 256 output tokens, batch size 1, and preprocessing identity `qwen-direct-path-v1`. Auto placement chooses `cuda:0` then BF16 when supported, otherwise FP16; CPU defaults to FP32. Audio is passed directly to Qwen without repository-side resampling, alignment, or timestamps. The earlier Phase 03 real smoke used 1.7B; that historical evidence is not evidence for the current 0.6B default.
 
 `_QwenPackageBackend` calls `Qwen3ASRModel.from_pretrained()` once and reuses the object for final and history files within the pipeline. Output contains stripped text, detected language when available, latency, audio SHA-256, checkpoint/backend, and cache-hit flag. Empty/malformed output and dependency/load/inference failures raise explicit ASR exceptions.
 

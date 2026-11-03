@@ -610,3 +610,95 @@ def test_invalid_proposal_budget_is_cumulative_across_valid_tool_calls(tmp_path)
         "model_bad_output_limit",
     ]
     assert len(client.requests) == 3
+
+
+def test_constrained_json_mode_executes_allowed_action_and_finishes(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    source, client = _source(
+        ModelResponse(content='{"name":"alarm.list","arguments":{}}'),
+        ModelResponse(content='{"name":"agent.finish","arguments":{"status":"done","reason":"complete"}}'),
+    )
+    constrained = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture", agent_output_mode="constrained-json"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "list alarms", constrained)
+
+    assert result.termination_reason == "model_completed"
+    assert [step.status for step in result.steps] == ["read_succeeded", "agent_finished"]
+    assert session.calls == [{"name": "alarm.list", "arguments": {}}]
+    assert client.requests[0].tools == ()
+    assert client.requests[0].response_format is not None
+
+
+def test_constrained_json_mode_rejects_unavailable_action_name(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    source, client = _source(
+        ModelResponse(content='{"name":"sms.send","arguments":{}}'),
+        ModelResponse(content='{"name":"agent.finish","arguments":{"status":"unsupported","reason":"n/a"}}'),
+    )
+    constrained = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture", agent_output_mode="constrained-json"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "send sms", constrained)
+
+    assert [step.status for step in result.steps] == ["model_bad_output", "agent_finished"]
+    assert result.termination_reason == "unsupported_request"
+    assert session.calls == []
+
+
+def test_constrained_json_mode_rejects_extra_top_level_fields(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    source, client = _source(
+        ModelResponse(content='{"name":"alarm.list","arguments":{},"extra":true}'),
+        ModelResponse(
+            content='{"name":"agent.finish","arguments":{"status":"unsupported","reason":"invalid input"}}'
+        ),
+    )
+    constrained = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture", agent_output_mode="constrained-json"),
+    )
+
+    result = Runtime(
+        make_dataset(tmp_path), session_factory=FakeFactory(session)
+    ).run("public_test_1", "list alarms", constrained)
+
+    assert [step.status for step in result.steps] == ["model_bad_output", "agent_finished"]
+    assert session.calls == []
+
+
+def test_constrained_json_exposes_tool_parameters_and_binds_action_schemas(tmp_path) -> None:
+    session = FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+    client = ScriptedModelClient([
+        ModelResponse(content='{"name":"agent.finish","arguments":{"status":"done","reason":"complete"}}')
+    ])
+    source = LlmDecisionSource(client, InferenceSettings(model="fixture", agent_output_mode="constrained-json"))
+    Runtime(make_dataset(tmp_path), session_factory=FakeFactory(session)).run("public_test_1", "finish", source)
+    request = client.requests[0]
+    payload = json.loads(request.messages[1]["content"])
+    actions = {action["name"]: action for action in payload["available_actions"]}
+    assert actions["alarm.create"]["parameters"]["required"] == ["time"]
+    assert actions["alarm.create"]["parameters"]["properties"]["time"]["type"] == "string"
+    assert actions["agent.finish"]["parameters"]["required"] == ["status", "reason"]
+    assert actions["agent.finish"]["parameters"]["properties"]["status"]["enum"] == ["done", "unsupported"]
+    assert "sms.send" not in actions
+    system = request.messages[0]["content"]
+    assert "Do not produce free-text JSON to terminate" not in system
+    assert "agent__finish" not in system
+    assert "JSON" in system
+    branches = request.response_format["json_schema"]["schema"]["oneOf"]
+    by_name = {branch["properties"]["name"]["enum"][0]: branch for branch in branches}
+    assert set(by_name) == set(actions)
+    for name, branch in by_name.items():
+        assert branch["properties"]["arguments"] == actions[name]["parameters"]
+        assert branch["required"] == ["name", "arguments"]
+        assert branch["additionalProperties"] is False
+    assert request.tools == ()

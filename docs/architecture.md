@@ -143,7 +143,7 @@ a claim that competition rules permit external processing. Confirm those rules a
 
 `Qwen3ASRTranscriber` has two strictly paired backends:
 
-- `qwen-asr-transformers` for `Qwen/Qwen3-ASR-1.7B` (default) or `Qwen/Qwen3-ASR-0.6B`;
+- `qwen-asr-transformers` for `Qwen/Qwen3-ASR-0.6B` (default) or `Qwen/Qwen3-ASR-1.7B`;
 - `native-hf` only for the corresponding `Qwen/Qwen3-ASR-*-hf` checkpoint.
 
 The default backend uses the official `qwen-asr` package, sends the resolved local audio path directly to Qwen, and

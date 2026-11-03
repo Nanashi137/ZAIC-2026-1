@@ -83,7 +83,7 @@ def test_openai_compatible_client_can_restore_auto_tool_choice() -> None:
     client.complete(
         ModelRequest(
             messages=(),
-            tools=(),
+            tools=({"type": "function", "function": {"name": "fixture"}},),
             settings=InferenceSettings(model="fixture", tool_choice="auto"),
         )
     )
@@ -178,3 +178,36 @@ def test_request_rate_limit_is_shared_by_client_calls() -> None:
     client.complete(request)
 
     assert fake_time.value == 1.0
+
+
+def test_response_format_is_forwarded_when_present() -> None:
+    transport = RecordingTransport()
+    client = OpenAICompatibleClient(base_url="http://localhost:1234/v1", transport=transport)
+    request = ModelRequest(
+        messages=(),
+        tools=(),
+        settings=InferenceSettings(model="fixture", agent_output_mode="constrained-json"),
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "next_action",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "enum": ["alarm.list"]},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+
+    client.complete(request)
+
+    payload = transport.calls[0]["payload"]
+    assert payload["response_format"]["type"] == "json_schema"
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    assert "parallel_tool_calls" not in payload

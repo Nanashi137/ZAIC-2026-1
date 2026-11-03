@@ -60,6 +60,10 @@ def test_qwen_initializes_once_reuses_model_and_preserves_language(tmp_path: Pat
     assert transcriber.initialization_latency_seconds is not None
 
 
+def test_default_checkpoint_stays_within_competition_model_budget() -> None:
+    assert Qwen3ASRSettings().checkpoint == "Qwen/Qwen3-ASR-0.6B"
+
+
 def test_audio_path_must_exist_and_stay_inside_allowed_root(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     allowed.mkdir()

@@ -10,6 +10,7 @@ from lifemate.audio_pipeline import AudioInferencePipeline
 from lifemate.data import DatasetReader
 from lifemate.model import InferenceSettings, ModelResponse, ModelToolCall, ScriptedModelClient
 from lifemate.runtime import ExplicitActionSource, Runtime, ToolAction
+from lifemate.scoring import replay_gold_state_hash
 from lifemate.sdk import OfficialSessionFactory
 from lifemate.tool_schema import FORBIDDEN_ROOT_KEYWORDS
 
@@ -52,6 +53,19 @@ def test_real_sdk_read_produces_official_submission_shape() -> None:
     assert result.submission["id"] == SAMPLE_ID
     assert result.submission["tool_calls"] == [{"name": "alarm.list", "arguments": {}}]
     assert len(result.submission["state_hash"]) == 64
+
+
+def test_offline_reference_replay_matches_full_sdk_hash_not_empty_changed_state() -> None:
+    calls = [{"name": "alarm.list", "arguments": {}}]
+    # A read has no changed apps (label.final_state={}), but the full hash is NOT
+    # hash({}). This guards the real SDK regression, not just a mocked equality.
+    reference = replay_gold_state_hash(DATASET_ROOT.resolve(), "public_test", SAMPLE_ID, calls)
+    from zaic_tools import state_hash
+
+    assert reference != state_hash({})
+    session = OfficialSessionFactory().create("public_test", SAMPLE_ID, DATASET_ROOT.resolve())
+    session.call("alarm.list", {})
+    assert reference == session.get_state_hash()
 
 
 def test_real_sdk_records_rejected_call_and_enforces_x_one_of() -> None:

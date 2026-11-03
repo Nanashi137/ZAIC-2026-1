@@ -49,7 +49,7 @@ class TranscriptionCacheError(ASRError):
 
 @dataclass(frozen=True)
 class Qwen3ASRSettings:
-    checkpoint: str = "Qwen/Qwen3-ASR-1.7B"
+    checkpoint: str = "Qwen/Qwen3-ASR-0.6B"
     revision: str | None = None
     backend: ASRBackendName = "qwen-asr-transformers"
     device: ASRDevice = "auto"

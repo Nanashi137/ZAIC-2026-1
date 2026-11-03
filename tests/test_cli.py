@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from lifemate.cli import build_batch_parser, build_parser, main
+from lifemate.cli import build_batch_parser, build_evaluate_parser, build_parser, main
 
 
 def test_powershell_friendly_single_tool_arguments() -> None:
@@ -49,6 +49,10 @@ def test_batch_cli_contract_and_backward_compatible_aliases() -> None:
     assert batch.base_url == "https://api.openai.com/v1"
     assert batch.workers == 1
     assert batch.limit == 5
+    assert batch.asr_checkpoint == "Qwen/Qwen3-ASR-0.6B"
+
+    evaluation = build_evaluate_parser().parse_args(["--output-dir", "outputs/evaluation"])
+    assert evaluation.asr_checkpoint == "Qwen/Qwen3-ASR-0.6B"
 
     single = build_parser().parse_args(
         ["--sample-id", "public_0001", "--transcript", "debug", "--max-model-tokens", "321"]

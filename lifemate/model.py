@@ -43,6 +43,7 @@ class InferenceSettings:
     max_output_tokens: int = 1024
     max_tokens_field: Literal["auto", "max_tokens", "max_completion_tokens"] = "auto"
     tool_choice: Literal["auto", "required"] = "required"
+    agent_output_mode: Literal["native", "constrained-json"] = "native"
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -53,6 +54,8 @@ class InferenceSettings:
             raise ValueError("max_output_tokens must be positive")
         if self.tool_choice not in {"auto", "required"}:
             raise ValueError("tool_choice must be auto or required")
+        if self.agent_output_mode not in {"native", "constrained-json"}:
+            raise ValueError("agent_output_mode must be native or constrained-json")
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,7 @@ class ModelRequest:
     tools: tuple[Mapping[str, Any], ...]
     settings: InferenceSettings
     deadline: SampleDeadline | None = None
+    response_format: Mapping[str, Any] | None = None
 
 
 class ModelClient(Protocol):
@@ -215,10 +219,17 @@ class OpenAICompatibleClient:
         payload: dict[str, Any] = {
             "model": request.settings.model,
             "messages": [dict(message) for message in request.messages],
-            "tools": [dict(tool) for tool in request.tools],
-            "tool_choice": request.settings.tool_choice,
-            "parallel_tool_calls": False,
         }
+        if request.tools:
+            payload.update(
+                {
+                    "tools": [dict(tool) for tool in request.tools],
+                    "tool_choice": request.settings.tool_choice,
+                    "parallel_tool_calls": False,
+                }
+            )
+        if request.response_format is not None:
+            payload["response_format"] = dict(request.response_format)
         token_field = request.settings.max_tokens_field
         if token_field == "auto":
             token_field = "max_completion_tokens" if self._official_openai else "max_tokens"

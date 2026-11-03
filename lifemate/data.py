@@ -67,10 +67,16 @@ class Catalog:
 class DatasetReader:
     """Stream official JSONL and load catalog metadata without touching app state."""
 
-    def __init__(self, dataset_root: Path | str, split: str = "public_test") -> None:
+    def __init__(
+        self,
+        dataset_root: Path | str,
+        split: str = "public_test",
+        *,
+        allow_train: bool = False,
+    ) -> None:
         if not _SPLIT_NAME.fullmatch(split):
             raise DatasetError(f"invalid split name: {split!r}")
-        if split == "train":
+        if split == "train" and not allow_train:
             raise DatasetError("the train split is explicitly out of scope")
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.split = split

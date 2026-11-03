@@ -156,8 +156,39 @@ Those need separate structural checks and, where available, official evaluation.
 
 ## Still unknown
 
-- Exact official scoring weights/details beyond the SDK README's replay/state comparison and tool-call F1 summary.
+- Exact official call equivalence/assignment, fuzzy thresholds, ordering and partial-match semantics.
 - Public hidden labels and semantic task success for any public-test sample.
+
+## Phase 04.6 scoring evidence (2026-11-02)
+
+The user explicitly authorized labeled-train evaluation after the original public-only audit. The original
+inspection scope above is historical. No raw environment states were inspected for this scoring work.
+
+- The user supplied the empty-gold special case and hash-gated call-F1 formula; the local kit's README confirms
+  state comparison and call F1 but does not ship a scorer implementing call matching.
+- Dataset README section 2.2 and each split's `zaic_tools/utils.py` comments mention fuzzy `x-match` scoring.
+  Search helpers are app behavior, not proof of scoring equivalence. No fuzzy matcher was invented.
+- Dataset README section 2.1 explicitly says `label.final_state` contains only changed apps. The first scoring
+  implementation incorrectly hashed that subset against the SDK's complete state; all-zero hash-match results
+  from that implementation are invalid evaluation evidence, including exact-call matches in the 100-sample run.
+- Full gold hashes now come from a separate selected-split SDK reference session after inference: validate/replay
+  labeled current-turn calls, then use `get_state_hash()`. References are evaluator-only and cached across A/B
+  modes, outside sample inference deadlines. No direct state-file reads, `get_state()`, state merging, or gold
+  leakage into planning occurs. Each inference still has exactly one independent ToolEnv.
+- Reference validation/execution failures produce an explicit unavailable hash/error, never a fabricated gold hash.
+  Train/public SDK hash implementations differ; only the selected split's SDK executes each reference.
+- `executor.py:95–103` still establishes SDK-rejected submitted calls remain in the trace. Pre-dispatch local
+  rejections do not. Complete SDK traces/hashes are used unchanged for scoring.
+- Consequently the primary metric is `challenge_score_estimate`, `challenge_score_exact=false`. See
+  `docs/evaluation.md` for exact fallback semantics, failure denominators and commands. No public-test
+  challenge score is fabricated, and no score claims official-equivalent matching.
+- Phase 04.6 review made evaluation artifacts auditable: nested read-only diagnostics serialize recursively,
+  model calls receive the same remaining sample deadline as the runtime, and aggregate metrics record model/mode,
+  budgets and ASR configuration. Constrained JSON no longer mixes `response_format` with empty native-tool controls,
+  and both output modes require the documented non-empty `agent.finish` payload.
+- The reviewed ASR A/B artifacts predate that provenance field. Their semantic comparison is paired, but their
+  wall-time comparison is cache-order biased (native 0/333 ASR cache hits; constrained JSON 333/333). They cannot
+  establish which checkpoint ran, so no resource-compliance claim is made from those files.
 - Final private-test Docker protocol and whether external network/model services are allowed.
 
 These remain blockers for later optimization/packaging, not for the completed text-only baseline.

@@ -15,7 +15,8 @@ Generate a competition-valid `submission.jsonl` for the **public_test** split us
 7. Local metrics are reported accurately; never conflate state-hash consistency with task success.
 
 ## Non-goals, for now
-- Any access to `train/`, training/fine-tuning, or train labels.
+- Training/fine-tuning or gold-label use in agent planning. User-authorized offline labeled-train semantic
+	evaluation and the Phase 04.6 challenge-score estimate are allowed; labels stay in the evaluation layer.
 - Building fake banking, SMS, calendar or home-automation services.
 - Reading source `state.json` as an information shortcut for the agent.
 - Heavy multi-agent frameworks, product UI, database, backend server, distributed architecture.

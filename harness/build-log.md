@@ -8,6 +8,7 @@
 | 2026-11-01 | 03 | `lifemate/asr.py`, `lifemate/audio_pipeline.py`, agent/runtime/CLI, ASR/history tests, smoke script, dependencies, architecture/plan/build docs | 37 tests passed; Ruff clean; real `Qwen/Qwen3-ASR-1.7B` CUDA/BF16 run transcribed final + 2 history clips; official validator: `1 lines checked, 0 schema errors`; repeat cache run: 3/3 hits | No reference transcripts or official scorer; native-HF and CPU paths configured but not real-smoked; exact competition network/private-container rules remain unknown | Stop; Phase 04 only on explicit request |
 | 2026-11-01 | 04 | `lifemate/batch.py`, provider retry/rate-limit/latency support, CLI subcommand, batch/model tests, full offline smoke, architecture/plan/build docs | 48 tests passed; Ruff/compileall clean; 634-row scripted-model run passed structural coverage and official validation (`634 lines checked, 0 schema errors`) | No paid/live LLM run or semantic score; offline rows intentionally use scripted unsupported decisions; private execution/network rules remain unknown | Stop; Phase 05 only on explicit request |
 | 2026-11-01 | 04.5 | compliance deadline/seed controls, ASR/model/runtime/batch/CLI integration, watchdog, environment-access hardening, tests and docs | 60 tests passed; Ruff/compileall clean; real-SDK competition single sample passed; development 3-row validator smoke passed; Windows watchdog hard-stop verified | `qwen-asr` synchronous CUDA cannot be cancelled in-process; final offline LLM and watchdog wiring are Phase 05 dependencies | Phase 05 local inference and packaging |
+| 2026-11-03 | 04.6 | finish/duplicate/read-loop controls and fail-soft rows; native/constrained-JSON mode plumbing; labeled oracle/ASR evaluation and supplied challenge formula; isolated SDK full-state gold replay; action-specific JSON schemas; controller/scoring diagnostics; deep JSON-safe export; deadline propagation; run provenance and cache-aware latency reporting; evaluation/contract/plan docs | 100-sample user A/B artifacts reviewed; focused agent/evaluation/model/compliance/SDK suite: 81 passed; full suite: 119 passed; Ruff clean; compileall and `git diff --check` clean. Native estimate: oracle 35.3960, ASR 12.9359; constrained JSON: oracle 22.9167, ASR 10.7333. | `challenge_score_estimate` only: official fuzzy/partial/order matcher unavailable. Saved ASR artifacts lack checkpoint provenance; native incurred 228.16 s ASR while constrained reused 333/333 cached turns, so saved wall-latency delta is not a fair mode comparison. Scores are partial train evidence only, not a public-score predictor. | Keep native mode; evaluate generic ASR/planning improvements on multiple fixed, stratified train folds before another public submission. |
 
 ## Phase 00 evidence
 
@@ -398,7 +399,7 @@ The watchdog is the hard-stop mechanism for blocking CUDA calls; Python deadline
 cancellation. Phase 05 must provide the fully offline local LLM, export pre-interpreter environment settings, and wire
 one watchdog child per scored sample. No external API, model download, or real ASR inference was run for Phase 04.5.
 
-## Phase 04.6 evidence — synthetic completion and bounded duplicate recovery
+## Phase 04.6a evidence — synthetic completion and bounded duplicate recovery
 
 Implemented on 2026-11-02 after inspecting the installed SDK lifecycle and trace behavior again. The official
 `Session.call` appends every dispatched call before execution, while `Session.validate` records nothing. Therefore
@@ -449,7 +450,7 @@ All three terminated as `model_completed`; no synthetic finish appeared in any s
 termination, trace, and budget regressions, not semantic task accuracy. Cached ASR text remains noisy, and in
 particular `public_0006` may have finished before performing the intended conditional action.
 
-## Phase 04.7 evidence — trial-01 coverage hardening
+## Phase 04.6b evidence — trial-01 coverage hardening
 
 Trial 01 produced 596 semantic completions and 38 failures. Its dominant failures were 17 malformed-output limits,
 10 timeouts, 8 tool-call-budget exhaustions, 2 duplicate-recovery exhaustions, and only one max-step exhaustion. The
@@ -485,7 +486,7 @@ Live llama.cpp checks with trial-02 settings:
 
 These are controller/coverage checks, not claims that the selected tool sequences are semantically optimal.
 
-## Phase 04.8 evidence — fail-soft submission coverage
+## Phase 04.6c evidence — fail-soft submission coverage
 
 Batch exceptions now retain a structurally valid row whenever the official SDK is usable. If a session already
 exists, the runner snapshots that same session so every recorded tool call is preserved. If ASR or controller setup
@@ -496,3 +497,54 @@ coverage rather than semantic success. Only an SDK creation/snapshot failure can
 Verification: `uv run --frozen pytest -q` → 79 passed; `uv run --frozen ruff check .` → all checks passed;
 `git diff --check` → clean. Regression tests cover both a pre-runtime empty fallback and a post-tool crash that reuses
 the existing session without duplicating ToolEnv construction.
+
+## Phase 04.6d evidence — labeled scoring and output-mode A/B review
+
+The evaluator uses the user-supplied empty-gold/hash-gated call-F1 formula. Because the kit documents fuzzy
+`x-match` behavior but does not ship the organizer's call-equivalence algorithm, results remain explicitly named
+`challenge_score_estimate` and use strict canonical unordered one-to-one matching. Gold full-state hashes come from
+isolated SDK replay after inference; train labels never enter the planner.
+
+Review on 2026-11-03 found and fixed five implementation mismatches:
+
+- nested `MappingProxyType` diagnostics could still fail JSON export even after only the outer mapping was copied;
+- evaluator deadlines reached `Runtime` but not `LlmDecisionSource`, so HTTP timeout/retry bounds could exceed the
+  remaining sample budget;
+- constrained-JSON requests sent `tools=[]`, `tool_choice=required` and `parallel_tool_calls=false` alongside
+  `response_format`, an avoidable provider compatibility conflict;
+- empty `agent.finish` arguments were silently normalized to a successful finish, weakening the documented schema;
+- evaluation defaults/provenance and latency did not expose the ASR checkpoint or cache-order bias.
+
+The writer now recursively converts read-only mappings, evaluation sets the same deadline on the decision source,
+tool controls are emitted only for native requests with tools, finish arguments remain strict, evaluation defaults to
+the competition-compatible 0.6B ASR, and metrics include run identity plus model-only and ASR/cache latency fields.
+
+Saved 100-sample A/B evidence (seed 42):
+
+| Input | Mode | Estimate | Hash match | Perfect | Partial | Tool name | Argument |
+|---|---|---:|---:|---:|---:|---:|---:|
+| oracle | native | 35.3960 | 0.57 | 0.21 | 0.24 | 0.6098 | 0.4773 |
+| oracle | constrained JSON | 22.9167 | 0.36 | 0.19 | 0.06 | 0.3933 | 0.3143 |
+| ASR | native | 12.9359 | 0.30 | 0.08 | 0.09 | 0.4045 | 0.2414 |
+| ASR | constrained JSON | 10.7333 | 0.27 | 0.08 | 0.05 | 0.3100 | 0.2146 |
+
+Native therefore remains the selected output mode. The ASR score delta is meaningful for this paired sample, but
+the saved ASR wall-time comparison is not: native had 0/333 cache hits and 228.16 seconds of ASR inference, while
+constrained JSON had 333/333 hits. The saved artifacts predate run-identity recording, so the exact checkpoint cannot
+be audited from them; future reports record it. These train estimates are diagnostic only and must not be optimized
+as if they were private-test truth.
+
+Final verification:
+
+```bash
+UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen pytest -q \
+  tests/test_evaluation.py tests/test_agent.py tests/test_model.py \
+  tests/test_compliance.py tests/test_sdk_integration.py
+# 81 passed in 2.58s
+
+UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen pytest -q
+# 119 passed in 2.41s
+
+UV_CACHE_DIR=/tmp/lifemate-uv-cache uv run --frozen ruff check lifemate tests scripts
+# All checks passed!
+```

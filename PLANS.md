@@ -10,13 +10,25 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 | 03 | Qwen3-ASR + conversation history | Audio and audio history reach agent correctly; reproducible ASR tests | COMPLETE (2026-11-01) |
 | 04 | Batch submission + diagnostics | Dynamic sample coverage, structural validator and official SDK schema validation | COMPLETE (2026-11-01) |
 | 04.5 | Competition compliance + runtime hardening | 28 s competition deadline, deterministic controls, one-ToolEnv scored path, compliance tests | COMPLETE (2026-11-01) |
-| 04.6 | Agent termination + duplicate recovery | Synthetic finish protocol, bounded duplicate recovery, default whole-sample budget, diagnostics | COMPLETE (2026-11-02) |
-| 04.7 | Trial-01 coverage hardening | Required tool calls, cumulative invalid budget, read-loop guard, finish-aware call budget, degraded rows | COMPLETE (2026-11-02) |
+| 04.6 | Agent/runtime hardening + labeled mode evaluation | Finish/duplicate/read-loop controls, fail-soft rows, native/constrained-JSON oracle/ASR evaluation, isolated full-state gold replay, challenge-score estimate, paired diagnostics, JSON-safe export and auditable run identity; 119 tests passed | COMPLETE (2026-11-03) |
 | 05 | Optimize + packaging | Repeatable experiment comparisons, selected configuration, private packaging only once rules verified | TODO |
 
-**Implementation order:** 00 → 01 → 02 → 03 → 04 → 04.5 → 05. You may implement the batch writer earlier if needed; keep milestone acceptance independent.
+**Implementation order:** 00 → 01 → 02 → 03 → 04 → 04.5 → 04.6 → 05. Keep milestone acceptance independent.
 
 ## Decision register
+- **Confirmed:** Phase 04.6 (2026-11-02) includes user-authorized labeled-train offline scoring. Primary
+	`challenge_score_estimate` applies the supplied empty-gold/hash-gated F1 formula over all evaluated samples.
+	Exact call matching is unavailable: deterministic strict unordered one-to-one fallback is explicitly approximate.
+	Gold hashes use isolated offline SDK reference replay after inference, cached across modes; hashing partial
+	`label.final_state` directly was incorrect and has been removed. No gold leaks into inference. Constrained JSON
+	now receives tool/finish schemas with action-specific output constraints. Error rates distinguish malformed
+	output, local schema/finish rejection, abnormal termination and missing results. Focused agent/evaluation/CLI/
+	compliance/SDK tests: 69 passed; subsequent export regressions reproduced and fixed read-only diagnostic
+	mappings reaching JSON serialization (both modes, raw capture on/off: 4 passed). Review on 2026-11-03 fixed
+	deep read-only mapping serialization, evaluation-to-model deadline propagation, constrained requests carrying
+	conflicting native tool controls, invalid empty finish acceptance, ASR provenance/defaults, and cache-biased
+	A/B latency reporting; focused suite: 81 passed, full suite: 119 passed.
+	Phase 05 is not advanced by this work.
 - **Confirmed:** tool execution uses official `ToolEnv`; actual calls and state hash are SDK-provided.
 - **Confirmed:** initial environment already includes previous history tool effects.
 - **Confirmed:** `sys.ask_missing_info` is always allowed, requires `tool_name` + `params`, records no state, and returns `waiting_for_user`.
@@ -36,9 +48,10 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
 - **Confirmed:** model completion uses the internal `agent.finish` action (provider-safe name `agent__finish`), which is intercepted before official validation/dispatch and never appears in the SDK trace or submission.
 - **Confirmed:** an SDK-confirmed duplicate write is rejected locally and receives at most one corrective model turn; uncertain writes still stop without retry. Explicitly requested identical repetition is conservatively recognized from the transcript.
 - **Confirmed:** normal single-sample and batch CLI runs now default to a 28-second monotonic cooperative deadline, capped below the 30-second per-sample watchdog boundary. Per-request token usage and phase timings are checkpointed; raw malformed responses are opt-in.
-- **Confirmed:** Phase 04.7 defaults native model requests to `tool_choice=required`, counts malformed responses cumulatively across valid calls, rejects identical reads without an intervening write, and leaves one corrective turn after the official call budget so `agent.finish` remains available.
+- **Confirmed:** Phase 04.6 defaults native model requests to `tool_choice=required`, counts malformed responses cumulatively across valid calls, rejects identical reads without an intervening write, and leaves one corrective turn after the official call budget so `agent.finish` remains available.
 - **Confirmed:** every recoverable batch failure produces a degraded, SDK-derived submission row. Failures after session creation preserve that session's complete trace/hash; failures before runtime create one empty SDK session and use its authoritative empty trace/hash. Metrics still distinguish semantic failures from structural submission coverage. Only SDK session creation/snapshot failure can leave coverage incomplete.
-- **Unverified:** exact scoring details/weights, model/API/network rules, and the private Docker execution contract.
+- **Unverified:** official call equivalence/assignment (including fuzzy `x-match`), model/API/network rules,
+  and the private Docker execution contract. Scoring formula supplied by the user; exact matcher remains unavailable.
 - **Next:** Phase 05 must implement/package the fully offline local LLM and wire the per-sample outer watchdog into the organizer-facing entrypoint. Do not run paid full-scale inference without authorization.
 
 When local source contradicts this document, update the decision register and cite the official file/line in docs instead of silently following assumptions.
