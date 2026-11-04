@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .compliance import SampleDeadline
@@ -38,6 +38,16 @@ _FINISH_PARAMETERS: Mapping[str, Any] = {
 AGENT_ARCHITECTURES = ("direct", "plan-ledger")
 PROMPT_VERSIONS = ("baseline", "grounded-v2")
 INVALID_RESPONSE_HISTORY_MODES = ("full", "compact")
+REQUEST_SEED_POLICY = "sha256-base-sample-request-v1"
+
+
+def derive_request_seed(base_seed: int, sample_id: str, request_index: int) -> int:
+    """Derive a provider-safe deterministic seed for one sample model turn."""
+
+    if base_seed < 0 or request_index < 0:
+        raise ValueError("base_seed and request_index must be non-negative")
+    material = f"{REQUEST_SEED_POLICY}\0{base_seed}\0{sample_id}\0{request_index}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big") & 0x7FFF_FFFF
 
 
 @dataclass(frozen=True)
@@ -338,9 +348,17 @@ class LlmDecisionSource:
         self._append_new_step_feedback(context.steps)
         assert self._registry is not None
         remaining_before = self._deadline.remaining_seconds() if self._deadline is not None else None
+        request_index = len(self._request_diagnostics)
+        request_seed = (
+            derive_request_seed(self.settings.seed, context.sample.id, request_index)
+            if self.settings.seed is not None
+            else None
+        )
         diagnostic: dict[str, Any] = {
             "sample_id": context.sample.id,
             "step_index": len(context.steps),
+            "request_index": request_index,
+            "request_seed": request_seed,
             "remaining_seconds_before": remaining_before,
         }
         self._request_diagnostics.append(diagnostic)
@@ -351,7 +369,11 @@ class LlmDecisionSource:
                 ModelRequest(
                     messages=tuple(self._messages),
                     tools=self._model_tools(),
-                    settings=self.settings,
+                    settings=(
+                        replace(self.settings, seed=request_seed)
+                        if request_seed is not None
+                        else self.settings
+                    ),
                     deadline=self._deadline,
                     response_format=self._response_format(),
                 )

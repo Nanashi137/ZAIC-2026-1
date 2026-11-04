@@ -83,6 +83,26 @@ Codex: work one phase at a time, using `harness/build/<phase>.md`. Do not mark c
   model calls to planned tools plus clarification/finish, and never dispatches its internal plan to the SDK. A
   collision-safe four-arm 100-sample runner supports oracle or uncached ChunkFormer-cap-1 audio and emits a paired
   summary. No live result or winning architecture is claimed yet.
+- **Confirmed:** confirmation experiments use a persisted 100-sample fold selected with seed 314159 after excluding
+  the complete seed-42 100-sample development fold. The confirmation runner stores selection provenance under
+  `outputs/agent/<experiment-name>`, compares only the three direct variants, keeps audio uncached, and reports
+  paired sample changes plus a deterministic bootstrap interval. No confirmation result is claimed before execution.
+- **Confirmed:** model requests can now be reproducibly seeded per sample turn with a stable SHA-256 derivation from
+  run seed, sample ID, and request index. The seed is sent in the chat-completion payload and logged in request
+  diagnostics; run identity can also record local model artifact path/name/size/SHA-256 and quantization. The Q4
+  oracle A/A runner writes collision-safe paired evidence under `outputs/a-a_test` and reports first-action and full
+  trace agreement in addition to score deltas.
+- **Confirmed:** the live Q4_K_M seeded oracle A/A run on the seed-314159 confirmation fold scored 25.7525 and
+  25.9889 (paired delta +0.236 points, bootstrap interval [-4.123, 4.461]). All 100 first-request seeds and every
+  shared request-index seed matched, but only 79/100 first actions and 42/100 complete traces matched. Request-level
+  seeds stabilize the aggregate estimate but do not make the current llama.cpp CUDA backend bitwise/trajectory
+  deterministic; agent experiments must retain paired intervals and treat small deltas cautiously.
+- **Rejected:** domain routing and the follow-up intent ledger were removed after paired oracle evaluation. Router v2
+  scored 24.52 versus 24.88 direct (delta -0.362, interval [-8.207, 7.658]) and left 25/91 actionable samples without
+  complete domain coverage. Intent-ledger scored 21.65 versus 24.88 direct (delta -3.233, interval [-11.071, 4.697]);
+  23/100 samples never produced a valid ledger, 95 gold calls were missing, and invalid-output rate reached 36%.
+  Persisted output evidence remains under `outputs/agent`, but both controllers, their CLI choices, and runners were
+  reverted. Future work must not put a mandatory global plan/router gate in front of execution.
 - **Unverified:** official call equivalence/assignment (including fuzzy `x-match`), model/API/network rules,
   and the private Docker execution contract. Scoring formula supplied by the user; exact matcher remains unavailable.
 - **Next:** Phase 05 must implement/package the fully offline local LLM and wire the per-sample outer watchdog into the organizer-facing entrypoint. Do not run paid full-scale inference without authorization.

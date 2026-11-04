@@ -40,6 +40,7 @@ class ModelClientError(RuntimeError):
 class InferenceSettings:
     model: str
     temperature: float | None = 0.0
+    seed: int | None = None
     max_output_tokens: int = 1024
     max_tokens_field: Literal["auto", "max_tokens", "max_completion_tokens"] = "auto"
     tool_choice: Literal["auto", "required"] = "required"
@@ -50,6 +51,8 @@ class InferenceSettings:
             raise ValueError("model must be non-empty")
         if self.temperature is not None and not 0 <= self.temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
+        if self.seed is not None and self.seed < 0:
+            raise ValueError("seed must be non-negative when configured")
         if self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
         if self.tool_choice not in {"auto", "required"}:
@@ -236,6 +239,8 @@ class OpenAICompatibleClient:
         payload[token_field] = request.settings.max_output_tokens
         if request.settings.temperature is not None:
             payload["temperature"] = request.settings.temperature
+        if request.settings.seed is not None:
+            payload["seed"] = request.settings.seed
         response = self._post_with_retries(payload, request.deadline)
         return _parse_chat_response(response)
 

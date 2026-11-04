@@ -56,7 +56,9 @@ def test_openai_compatible_client_builds_sequential_tool_request() -> None:
     request = ModelRequest(
         messages=({"role": "user", "content": "test"},),
         tools=({"type": "function", "function": {"name": "alarm__list", "parameters": {}}},),
-        settings=InferenceSettings(model="local-model", temperature=0.2, max_output_tokens=333),
+        settings=InferenceSettings(
+            model="local-model", temperature=0.2, seed=12345, max_output_tokens=333
+        ),
     )
 
     response = client.complete(request)
@@ -67,6 +69,7 @@ def test_openai_compatible_client_builds_sequential_tool_request() -> None:
     assert sent["payload"]["parallel_tool_calls"] is False
     assert sent["payload"]["tool_choice"] == "required"
     assert sent["payload"]["temperature"] == 0.2
+    assert sent["payload"]["seed"] == 12345
     assert sent["payload"]["max_tokens"] == 333
     assert response.tool_calls[0].name == "alarm__list"
     assert response.usage.as_dict() == {
@@ -89,6 +92,11 @@ def test_openai_compatible_client_can_restore_auto_tool_choice() -> None:
     )
 
     assert transport.calls[0]["payload"]["tool_choice"] == "auto"
+
+
+def test_inference_seed_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="seed must be non-negative"):
+        InferenceSettings(model="fixture", seed=-1)
 
 
 def test_official_openai_uses_current_token_field_and_can_omit_temperature() -> None:

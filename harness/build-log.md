@@ -14,6 +14,7 @@
 | 2026-11-03 | 05 (ChunkFormer CTC) | Added explicit `chunkformer-ctc` and `chunkformer-rnnt` benchmark identities, checkpoint-family validation, CTC-specific config/report behavior, a paired CTC/RNN-T cap-1/cap-2 runner, selectable single/batch/evaluation ASR engines, tests and docs | Tests verify CTC has no RNN-T cap, never patches RNN-T search, rejects a transducer checkpoint, and is represented completely in evaluation run identity. Full suite: 133 passed; Ruff, compileall and shell syntax checks clean. | CTC checkpoint weights are not present locally, so no live CTC inference or quality/resource result is claimed yet. CLI default remains Qwen; promotion requires benchmark and downstream semantic evidence. | Run `lifemate/asr/run_chunkformer_decoders.sh` on 500 fixed clips and compare complete artifacts, then evaluate the best two engines end to end. |
 | 2026-11-03 | 05 (LLM oracle benchmark) | Added a collision-safe Bash wrapper plus model/mode-labeled semantic-evaluation and resume-aware public-batch tqdm progress; suppressed ChunkFormer's nested checkpoint-fetch and per-audio progress bars | Wrapper pins seed, sample count, native mode, controller/token budgets, retry policy and competition timeout to the reused Qwen3.5-4B baseline while exposing URL/model/run label. Existing-output refusal was verified; all progress paths are unit-tested; full suite 135 passed; Ruff, compileall, and `git diff --check` clean. | No new live LLM inference was run. The local folder is named `outputs/llm-bench`, despite the request's `llm-bench-mark` spelling; preserving it avoids splitting the baseline. | Run the 100-sample audio evaluation before the full public batch; compare complete metrics without fitting changes to the train subset. |
 | 2026-11-03 | 05 (agent architecture benchmark) | Added versioned grounded prompting, compact invalid-response recovery, a native structured plan-ledger with allowed-tool routing, complete run provenance, a collision-safe four-arm runner, and JSON/Markdown summary generation | Scripted coverage verifies grounded plan evidence, plan-only first request, routed execution tools, compact invalid context, and absence of the internal plan from SDK/submission calls. The runner pins the paired 100-sample protocol and uses uncached ChunkFormer cap 1 in audio mode. Full suite: 140 passed; Ruff, compileall, shell syntax, CLI help, runner usage, and `git diff --check` clean. | No live model benchmark was run and no architecture was selected. The local score remains an approximate strict matcher, so development results require a disjoint confirmation fold. | Run oracle screening first, take the best two to uncached audio, then confirm the winner on a predeclared disjoint fold before another public submission. |
+| 2026-11-03 | 05 (agent confirmation harness) | Added deterministic disjoint-fold selection, persisted selection provenance, three-arm oracle/uncached-audio confirmation under `outputs/agent/<experiment-name>`, and paired bootstrap reporting | Unit coverage verifies deterministic zero-overlap selection and paired report generation. Real train selection produced 100 IDs, zero overlap, excluded hash `4469162d...5117`, and confirmation hash `1b63d7c9...e4a`; full suite 141 passed; Ruff, compileall, lock, shell syntax, and diff checks clean. | No confirmation inference was run. Bootstrap intervals summarize this local approximate score only and are not organizer confidence intervals. | Run oracle and uncached audio with the same experiment name; promote a direct variant only if the disjoint evidence is consistent. |
 
 ## Phase 00 evidence
 
@@ -136,6 +137,71 @@ uv run pytest -q
 uv run ruff check lifemate tests scripts
 # All checks passed!
 ```
+
+## Phase 05 evidence — request-seeded oracle A/A harness
+
+Model inference now sends one deterministic request seed per sample turn, derived from the run seed, sample ID, and
+request index. Diagnostics and run identity expose the policy/base seed, and optional local GGUF provenance records
+artifact name, size, SHA-256, and quantization. The Q4 oracle A/A runner uses the persisted seed-314159 confirmation
+fold, refuses overwrite, and emits paired score plus first-action/full-trace/termination/hash agreement under
+`outputs/a-a_test`.
+
+Focused offline verification on 2026-11-04:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run --frozen pytest -q \
+  tests/test_model.py tests/test_agent.py tests/test_cli.py tests/test_agent_benchmark_report.py
+# 42 passed in 2.04s
+```
+
+Live Q4_K_M A/A evidence completed on the persisted 100-sample confirmation fold:
+
+- scores 25.7525 and 25.9889; paired delta +0.236 points, bootstrap interval [-4.123, 4.461];
+- 79/100 identical first actions, 42/100 identical full traces, 92/100 identical terminations, and 76/100 identical
+  final state hashes;
+- all 100 first-request seeds and every common request-index seed were identical across repeats;
+- artifact provenance: `Qwen3.5-4B-Q4_K_M.gguf`, 2,740,937,888 bytes, SHA-256
+  `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
+
+The request-seed implementation is functioning, but current llama.cpp CUDA generation remains trajectory-
+nondeterministic. Small agent deltas therefore require repeated or paired-interval confirmation.
+
+## Phase 05 evidence — recoverable tool-domain router
+
+Added opt-in native `routed-direct`. The v1 paired 100-sample oracle experiment scored 26.13 versus 26.83 for direct
+(delta -0.705, paired bootstrap interval [-7.949, 6.623]). Routing reduced mean model tokens by about 46% and latency
+by about 9%, but its executed-domain recall proxy fell from 90.8% to 75.8%. It helped one-domain examples and hurt
+empty-route and three-or-more-domain examples, identifying route recall as the next constraint rather than executor
+efficiency.
+
+Router v2 therefore permits an empty initial route for no-action requests, raises the recall-first initial cap from
+four to six domains, and automatically adds transitive tool-schema `x-ref` domain dependencies. One recoverable
+two-domain expansion remains available; prompt guidance requires an explicit coverage check before clarification or
+termination. Runtime validation keeps route actions out of SDK traces and official call budgets, while evaluation
+records now persist selected, dependency-added, and effective domains for direct recall analysis. The Q4 benchmark
+wrapper fixes the seed-314159 confirmation IDs and writes paired evidence to `outputs/agent/tool-router-oracle-v2` by
+default.
+
+Offline verification on 2026-11-04: Ruff passed; the full test suite passed 149/149; bytecode compilation, benchmark
+shell syntax, and `git diff --check` passed.
+
+Live router-v2 oracle evidence on the fixed seed-314159 confirmation fold scored 24.52 versus 24.88 for its paired
+direct control (delta -0.362, bootstrap interval [-8.207, 7.658]). It cut tokens/sample from 27,525 to 15,197, but
+complete application-domain coverage reached only 66/91 actionable samples after expansion. No empty route was
+selected, expansion occurred three times, and all 10 samples needing at least three application domains scored zero.
+
+## Phase 05 evidence — hybrid intent ledger
+
+The paired intent-ledger oracle run scored 21.65 versus 24.88 direct (delta -3.233, bootstrap interval
+[-11.071, 4.697]). Although extra calls fell from 85 to 31, missing calls rose from 9 to 95, tool-name accuracy fell
+from 57.2% to 28.2%, and invalid-output rate rose from 2% to 36%. Twenty-three samples exhausted invalid proposals
+without an accepted ledger; the read/write classifier also blocked completion after otherwise correct calls. The
+earlier routed-direct implementation and this follow-up ledger were therefore removed from runtime, CLI, tests,
+current architecture docs, and runners. Persisted experiment outputs remain as negative evidence.
+
+Post-revert verification on 2026-11-04: full suite passed 144/144; Ruff, bytecode compilation, remaining benchmark
+shell syntax, and `git diff --check` passed. Repository search found no routed/intent controller references in current
+runtime, tests, scripts, or architecture/evaluation documentation.
 
 Verified native Windows environment:
 

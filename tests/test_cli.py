@@ -5,6 +5,7 @@ import pytest
 from lifemate.cli import (
     _asr_run_identity,
     _build_base_asr_transcriber,
+    _model_provenance,
     build_batch_parser,
     build_evaluate_parser,
     build_parser,
@@ -61,6 +62,7 @@ def test_batch_cli_contract_and_backward_compatible_aliases() -> None:
     assert batch.agent_architecture == "direct"
     assert batch.prompt_version == "baseline"
     assert batch.invalid_response_history == "full"
+    assert batch.model_artifact_path is None
 
     evaluation = build_evaluate_parser().parse_args(["--output-dir", "outputs/evaluation"])
     assert evaluation.asr_checkpoint == "Qwen/Qwen3-ASR-0.6B"
@@ -80,6 +82,30 @@ def test_batch_cli_contract_and_backward_compatible_aliases() -> None:
         ["--sample-id", "public_0001", "--transcript", "debug", "--max-model-tokens", "321"]
     )
     assert single.max_output_tokens == 321
+
+
+def test_model_provenance_records_artifact_quantization_and_hash(tmp_path) -> None:
+    artifact = tmp_path / "model-Q4_K_M.gguf"
+    artifact.write_bytes(b"fixture-model")
+    args = build_evaluate_parser().parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "evaluation"),
+            "--model-artifact-path",
+            str(artifact),
+            "--model-quantization",
+            "Q4_K_M",
+        ]
+    )
+
+    identity = _model_provenance(args)
+
+    assert identity is not None
+    assert identity["artifact_name"] == artifact.name
+    assert identity["quantization"] == "Q4_K_M"
+    assert identity["artifact_size_bytes"] == len(b"fixture-model")
+    assert len(identity["artifact_sha256"]) == 64
+    assert identity["sha256_source"] == "computed"
 
 
 def test_evaluation_cli_builds_chunkformer_ctc_without_rnnt_settings(tmp_path) -> None:

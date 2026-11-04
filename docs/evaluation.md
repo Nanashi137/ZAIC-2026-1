@@ -239,6 +239,14 @@ The third argument selects `oracle` or `asr`. ASR mode pins ChunkFormer RNN-T ca
 to overwrite its output root and writes `agent-benchmark-summary.json` plus a Markdown comparison after all four
 runs. No variant is promoted from this development subset alone; confirm the winner on a predeclared disjoint fold.
 
+`scripts/run_agent_confirmation.sh` implements that confirmation. It deterministically excludes all 100 seed-42
+IDs, selects 100 IDs from the remainder with seed 314159, and persists the exact ordered ID list plus both selection
+hashes beneath `outputs/agent/<experiment-name>/`. Oracle and ASR runs can share one experiment name in separate
+subdirectories. The confirmation compares only baseline-direct, grounded-direct, and grounded-compact; it does not
+rerun the rejected strict plan-ledger. Audio remains uncached. The summary includes deterministic paired bootstrap
+intervals and improved/worsened/equal sample counts, which remain development evidence rather than an official
+significance claim.
+
 ChunkFormer downstream evaluation is selectable without changing the Qwen default. After the standalone decoder
 benchmark identifies a candidate, use a distinct output directory and cache identity, for example CTC:
 
@@ -267,6 +275,19 @@ For RNN-T, change the engine/checkpoint/cache/output and add
 `--asr-rnnt-max-symbols-per-frame 1` or `2`. Run modes independently when comparing end-to-end wall time; reusing a
 populated cache intentionally measures cached inference rather than ASR latency. Every evaluation config records the
 engine, checkpoint, decoder settings, device, dtype, and cache identity.
+
+### Deterministic model-request A/A checks
+
+Evaluation and batch runs derive a request-level seed from the configured run seed, sample ID, and zero-based model
+request index using `sha256-base-sample-request-v1`. The derived 31-bit value is sent in every OpenAI-compatible
+chat-completion payload and recorded in per-request diagnostics. Provider retries reuse the same payload and seed.
+Run identity records the base seed and policy; optional `--model-artifact-path`, `--model-quantization`, and
+`--model-artifact-sha256` flags record the exact served local artifact without exposing it to the model.
+
+`scripts/run_oracle_aa.sh` runs the same grounded/direct oracle configuration twice on the persisted seed-314159
+confirmation IDs. It defaults to the local Q4_K_M GGUF, hashes the artifact once, refuses to overwrite evidence, and
+writes both runs plus paired score/first-action/full-trace/termination/hash agreement under
+`outputs/a-a_test/<experiment-name>`.
 
 ## What the public kit proves (and does not)
 - `env.validate` / official `--validate`: validates tool-call schemas and availability; **does not score intent correctness**.

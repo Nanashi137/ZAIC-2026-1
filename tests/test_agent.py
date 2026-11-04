@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from lifemate.agent import LlmDecisionSource, ModelToolRegistry
+from lifemate.agent import LlmDecisionSource, ModelToolRegistry, derive_request_seed
 from lifemate.model import (
     InferenceSettings,
     ModelResponse,
@@ -71,6 +71,29 @@ def _source(*responses: ModelResponse, max_invalid_proposals: int = 2):
         max_invalid_proposals=max_invalid_proposals,
     )
     return source, client
+
+
+def test_request_seed_is_stable_per_sample_and_request_index(tmp_path) -> None:
+    client = ScriptedModelClient([ModelResponse(content="invalid"), _finish_response()])
+    source = LlmDecisionSource(
+        client,
+        InferenceSettings(model="fixture-model", seed=42),
+    )
+
+    Runtime(
+        make_dataset(tmp_path),
+        session_factory=FakeFactory(
+            FakeSession({"alarm.list", "alarm.create", "sys.ask_missing_info"})
+        ),
+    ).run("public_test_1", "list alarms", source)
+
+    expected = [
+        derive_request_seed(42, "public_test_1", 0),
+        derive_request_seed(42, "public_test_1", 1),
+    ]
+    assert [request.settings.seed for request in client.requests] == expected
+    assert [item["request_seed"] for item in source.request_diagnostics] == expected
+    assert expected[0] != expected[1]
 
 
 def test_dynamic_tools_keep_only_allowed_and_translate_sdk_extensions() -> None:

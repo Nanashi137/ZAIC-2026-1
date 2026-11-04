@@ -66,3 +66,19 @@ per-sample outer watchdog and a fully offline local LLM backend.
   to the plan, and is intercepted before SDK validation. Scripted tests prove the plan is absent from SDK/submission
   calls. `scripts/run_agent_benchmark.sh` runs four collision-safe paired variants; audio mode explicitly disables
   the transcription cache. No live architecture benchmark has been run.
+- The disjoint confirmation runner excludes the original seed-42 IDs, materializes a seed-314159 100-sample fold
+  with overlap/hash provenance, and stores oracle/audio runs beneath one `outputs/agent/<experiment-name>` root.
+  It omits plan-ledger and adds paired score deltas with deterministic bootstrap intervals to the summary.
+- OpenAI-compatible model calls now carry a deterministic request seed derived from run seed, sample ID, and request
+  index, with the value retained in diagnostics. Optional artifact path/quantization/SHA-256 provenance is included
+  in sanitized run identity. `scripts/run_oracle_aa.sh` runs two Q4 grounded/direct oracle repeats on the persisted
+  confirmation fold beneath `outputs/a-a_test` and produces paired action/trace agreement evidence.
+- The completed Q4_K_M A/A repeats scored 25.7525 and 25.9889. Their +0.236-point paired delta has bootstrap interval
+  [-4.123, 4.461]; agreement was 79/100 first actions, 42/100 full traces, 92/100 terminations, and 76/100 state
+  hashes. Diagnostics confirm identical derived seeds for every shared request index. The local llama.cpp CUDA path
+  therefore remains trajectory-nondeterministic even with request seeding, although aggregate score was stable here.
+- Domain routing and the follow-up intent ledger were rejected and removed. Router v2 scored 24.52 against 24.88
+  direct and failed to cover at least one required domain in 25/91 actionable samples. Intent-ledger scored 21.65,
+  with 23 invalid-ledger terminations, 95 missing calls, and 36% invalid-output rate. Saved outputs retain the evidence;
+  production/CLI code is back to direct and the older plan-ledger experiment only. Do not reintroduce a mandatory
+  global classification gate for this 4B model.

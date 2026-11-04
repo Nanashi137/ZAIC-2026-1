@@ -16,6 +16,7 @@ from .agent import (
     AGENT_ARCHITECTURES,
     INVALID_RESPONSE_HISTORY_MODES,
     PROMPT_VERSIONS,
+    REQUEST_SEED_POLICY,
     LlmDecisionSource,
 )
 from .asr import (
@@ -99,6 +100,59 @@ def _add_agent_experiment_arguments(parser: argparse.ArgumentParser) -> None:
         choices=INVALID_RESPONSE_HISTORY_MODES,
         default="full",
     )
+
+
+def _add_model_provenance_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model-artifact-path",
+        type=Path,
+        help="Optional local served model artifact path recorded in run metadata.",
+    )
+    parser.add_argument(
+        "--model-quantization",
+        help="Optional served quantization label, for example Q4_K_M or Q8_0.",
+    )
+    parser.add_argument(
+        "--model-artifact-sha256",
+        help="Optional precomputed lowercase SHA-256 for the served model artifact.",
+    )
+
+
+def _model_provenance(args: argparse.Namespace) -> dict[str, Any] | None:
+    path: Path | None = args.model_artifact_path
+    quantization: str | None = args.model_quantization
+    supplied_digest: str | None = args.model_artifact_sha256
+    if path is None and quantization is None and supplied_digest is None:
+        return None
+    if supplied_digest is not None:
+        supplied_digest = supplied_digest.strip().lower()
+        if len(supplied_digest) != 64 or any(c not in "0123456789abcdef" for c in supplied_digest):
+            raise ValueError("--model-artifact-sha256 must contain exactly 64 hexadecimal characters")
+    identity: dict[str, Any] = {"quantization": quantization}
+    if path is not None:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise ValueError(f"model artifact is not a file: {resolved}")
+        identity.update(
+            {
+                "artifact_path": str(resolved),
+                "artifact_name": resolved.name,
+                "artifact_size_bytes": resolved.stat().st_size,
+            }
+        )
+        if supplied_digest is None:
+            digest = hashlib.sha256()
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            supplied_digest = digest.hexdigest()
+            identity["sha256_source"] = "computed"
+        else:
+            identity["sha256_source"] = "provided"
+    elif supplied_digest is not None:
+        identity["sha256_source"] = "provided-without-path"
+    identity["artifact_sha256"] = supplied_digest
+    return identity
 
 
 def _build_base_asr_transcriber(args: argparse.Namespace, split_dir: Path):
@@ -193,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", choices=("openai-compatible",), default="openai-compatible")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    _add_model_provenance_arguments(parser)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--temperature", type=_temperature, default=0.0)
     parser.add_argument("--max-output-tokens", "--max-model-tokens", dest="max_output_tokens", type=int, default=1024)
@@ -262,6 +317,7 @@ def build_batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    _add_model_provenance_arguments(parser)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--max-model-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=_temperature, default=0.0)
@@ -326,6 +382,7 @@ def build_evaluate_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    _add_model_provenance_arguments(parser)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--max-model-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=_temperature, default=0.0)
@@ -397,9 +454,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--competition-mode requires deterministic execution")
     if args.competition_mode and args.mode == "model" and args.temperature != 0.0:
         parser.error("--competition-mode requires --temperature 0")
-    if args.mode == "model" and args.agent_architecture == "plan-ledger" and args.agent_output_mode != "native":
-        parser.error("--agent-architecture plan-ledger requires --agent-output-mode native")
+    if (
+        args.mode == "model"
+        and args.agent_architecture == "plan-ledger"
+        and args.agent_output_mode != "native"
+    ):
+        parser.error(f"--agent-architecture {args.agent_architecture} requires native output mode")
     configure_reproducibility(args.seed, deterministic=not args.no_deterministic)
+    try:
+        model_provenance = _model_provenance(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     timeout = args.sample_timeout_seconds
     deadline = SampleDeadline.start(timeout) if timeout is not None else None
     actions = list(args.action)
@@ -431,6 +496,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             InferenceSettings(
                 model=args.model,
                 temperature=args.temperature,
+                seed=args.seed,
                 max_output_tokens=args.max_output_tokens,
                 max_tokens_field=args.token_limit_field,
                 tool_choice=args.tool_choice,
@@ -472,6 +538,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(json.dumps(record, ensure_ascii=False))
     diagnostics = {
         "decision_source": result.decision_source,
+        "model_provenance": model_provenance if args.mode == "model" else None,
+        "request_seed_policy": REQUEST_SEED_POLICY if args.mode == "model" else None,
         "termination_reason": result.termination_reason,
         "tool_calls_sent": result.tool_calls_sent,
         "model_usage": dict(result.model_usage) if result.model_usage is not None else None,
@@ -529,12 +597,16 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
     if args.competition_mode and args.temperature != 0.0:
         parser.error("--competition-mode requires --temperature 0")
     if args.agent_architecture == "plan-ledger" and args.agent_output_mode != "native":
-        parser.error("--agent-architecture plan-ledger requires --agent-output-mode native")
+        parser.error(f"--agent-architecture {args.agent_architecture} requires native output mode")
     if not _is_local_url(args.base_url) and not args.allow_external_data:
         parser.error("a non-local --base-url requires explicit --allow-external-data approval")
     if args.competition_mode and not _is_local_url(args.base_url):
         parser.error("--competition-mode forbids non-local model endpoints")
     configure_reproducibility(args.seed, deterministic=not args.no_deterministic)
+    try:
+        model_provenance = _model_provenance(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
     if _is_official_openai_url(args.base_url) and not api_key:
@@ -553,6 +625,7 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
     inference_settings = InferenceSettings(
         model=args.model,
         temperature=args.temperature,
+        seed=args.seed,
         max_output_tokens=args.max_model_tokens,
         max_tokens_field=args.token_limit_field,
         tool_choice=args.tool_choice,
@@ -605,8 +678,11 @@ def batch_main(argv: Sequence[str] | None = None) -> int:
 
     run_identity = {
         "model": args.model,
+        "model_provenance": model_provenance,
         "base_url": args.base_url,
         "temperature": args.temperature,
+        "request_seed_policy": REQUEST_SEED_POLICY,
+        "request_seed_base": args.seed,
         "max_model_tokens": args.max_model_tokens,
         "token_limit_field": args.token_limit_field,
         "tool_choice": args.tool_choice,
@@ -688,7 +764,9 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
     if args.agent_architecture == "plan-ledger" and (
         args.agent_output_mode != "native" or args.compare_with_mode is not None
     ):
-        parser.error("plan-ledger evaluation requires native mode without --compare-with-mode")
+        parser.error(
+            f"{args.agent_architecture} evaluation requires native mode without --compare-with-mode"
+        )
     if args.competition_mode and args.no_deterministic:
         parser.error("--competition-mode requires deterministic execution")
     if args.competition_mode and args.temperature != 0.0:
@@ -699,6 +777,10 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
         parser.error("--competition-mode forbids non-local model endpoints")
 
     configure_reproducibility(args.seed, deterministic=not args.no_deterministic)
+    try:
+        model_provenance = _model_provenance(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     dataset = DatasetReader(args.dataset_root, args.split, allow_train=True)
     references = load_label_references(dataset)
 
@@ -721,9 +803,12 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
     asr_identity = _asr_run_identity(asr_settings, args) if asr_settings is not None else None
     common_run_identity = {
         "model": args.model,
+        "model_provenance": model_provenance,
         "base_url": args.base_url,
         "input_mode": args.input_mode,
         "seed": args.seed,
+        "request_seed_policy": REQUEST_SEED_POLICY,
+        "request_seed_base": args.seed,
         "deterministic": not args.no_deterministic,
         "competition_mode": args.competition_mode,
         "temperature": args.temperature,
@@ -782,6 +867,7 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
         inference_settings = InferenceSettings(
             model=args.model,
             temperature=args.temperature,
+            seed=args.seed,
             max_output_tokens=args.max_model_tokens,
             max_tokens_field=args.token_limit_field,
             tool_choice=args.tool_choice,
